@@ -7,7 +7,7 @@ interface ColorPickerProps {
 
 export default function ColorPicker({ color, onChange }: ColorPickerProps) {
   return (
-    <div className="fixed top-4 right-4 z-50 flex flex-col gap-3 rounded-xl bg-zinc-900 p-4 shadow-2xl">
+    <div className="flex flex-col gap-3">
       <HexColorPicker color={color} onChange={onChange} />
 
       <div className="flex w-[200px] items-center gap-2">

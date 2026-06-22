@@ -1,66 +1,34 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import "./App.css";
 import ColorPicker from "./components/ColorPicker";
+import WebGPUCanvas from "./components/WebGPUCanvas";
 
 export default function App() {
   const [color, setColor] = useState("#aabbcc");
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const isDrawingRef = useRef(false);
-  const lastPosRef = useRef({ x: 0, y: 0 });
-
-  function getCtx() {
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    return canvas.getContext("2d");
-  }
-
-  function drawLine(x1: number, y1: number, x2: number, y2: number) {
-    const ctx = getCtx();
-    if (!ctx) return;
-
-    ctx.beginPath();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 10;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
-  }
-
-  function startDrawing(e: React.MouseEvent<HTMLCanvasElement>) {
-    isDrawingRef.current = true;
-    lastPosRef.current = { x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY };
-  }
-
-  function draw(e: React.MouseEvent<HTMLCanvasElement>) {
-    if (!isDrawingRef.current) return;
-
-    const { x, y } = lastPosRef.current;
-    const { offsetX, offsetY } = e.nativeEvent;
-
-    drawLine(x, y, offsetX, offsetY);
-    lastPosRef.current = { x: offsetX, y: offsetY };
-  }
-
-  function stopDrawing() {
-    isDrawingRef.current = false;
-  }
+  const [brushSize, setBrushSize] = useState(10);
 
   return (
     <>
-      <ColorPicker color={color} onChange={setColor} />
+      <div className="fixed top-4 right-4 z-50 flex flex-col gap-3 rounded-xl bg-zinc-900 p-4 shadow-2xl">
+        <ColorPicker color={color} onChange={setColor} />
+
+        <div className="flex w-[200px] flex-col gap-1">
+          <label className="text-xs font-medium text-zinc-300">
+            Size: {brushSize}px
+          </label>
+          <input
+            type="range"
+            min={1}
+            max={100}
+            value={brushSize}
+            onChange={(e) => setBrushSize(Number(e.target.value))}
+            className="w-full accent-zinc-100"
+          />
+        </div>
+      </div>
+
       <div className="flex h-screen justify-center items-center">
-        <canvas
-          ref={canvasRef}
-          className="bg-white rounded-md"
-          width={600}
-          height={400}
-          onMouseDown={startDrawing}
-          onMouseMove={draw}
-          onMouseUp={stopDrawing}
-          onMouseLeave={stopDrawing}
-        />
+        <WebGPUCanvas color={color} brushSize={brushSize} />
       </div>
     </>
   );
