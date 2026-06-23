@@ -736,7 +736,7 @@
 
   <canvas
     bind:this={canvasEl}
-    class="block h-screen w-screen bg-neutral-400"
+    class="block h-screen w-screen bg-neutral-800"
     style="image-rendering: {imageRenderHint}; cursor: {cursor}"
     onwheel={handleWheel}
     onpointerdown={handlePointerDown}

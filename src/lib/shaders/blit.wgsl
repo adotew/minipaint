@@ -19,7 +19,6 @@ fn vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
 fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let paintCoord = pos.xy * view.scale + view.offset;
   let uv = paintCoord / view.paintDims;
-  // Clamp UVs to prevent texture bleeding when panned outside paint area
   let clampedUV = clamp(uv, vec2f(0.0), vec2f(1.0));
   return textureSample(paintTex, paintSampler, clampedUV);
 }
