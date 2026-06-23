@@ -1,5 +1,12 @@
 @group(0) @binding(0) var paintSampler: sampler;
 @group(0) @binding(1) var paintTex: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> view: View;
+
+struct View {
+  scale: vec2f,
+  offset: vec2f,
+  paintDims: vec2f,
+};
 
 @vertex
 fn vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
@@ -10,7 +17,9 @@ fn vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
 
 @fragment
 fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-  let dims = vec2f(textureDimensions(paintTex));
-  let uv = pos.xy / dims;
-  return textureSample(paintTex, paintSampler, uv);
+  let paintCoord = pos.xy * view.scale + view.offset;
+  let uv = paintCoord / view.paintDims;
+  // Clamp UVs to prevent texture bleeding when panned outside paint area
+  let clampedUV = clamp(uv, vec2f(0.0), vec2f(1.0));
+  return textureSample(paintTex, paintSampler, clampedUV);
 }

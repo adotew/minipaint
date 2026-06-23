@@ -11,10 +11,11 @@
 
   let { color, brushSize }: Props = $props();
 
-  const CANVAS_WIDTH = 600;
-  const CANVAS_HEIGHT = 400;
+  const CANVAS_WIDTH = 4000;
+  const CANVAS_HEIGHT = 4000;
   const MIN_ZOOM = 0.01;
   const MAX_ZOOM = 32;
+  const MAX_STAMPS_PER_FRAME = 1024;
 
   // ---- DOM binding ----
   let canvasEl: HTMLCanvasElement | undefined = $state();
@@ -27,16 +28,8 @@
   let isPanning = $state(false);
   let isSpaceHeld = $state(false);
 
-  // ---- CSS transform (computed from DOM size + zoom/offset) ----
-  let canvasTransform = $state("scale(1)");
-  let imageRenderHint = $state("auto");
-
-  $effect(() => {
-    const cw = canvasEl?.clientWidth ?? CANVAS_WIDTH;
-    const ch = canvasEl?.clientHeight ?? CANVAS_HEIGHT;
-    canvasTransform = `scale(${zoom}) translate(${-offsetX * cw / CANVAS_WIDTH}px, ${-offsetY * ch / CANVAS_HEIGHT}px)`;
-    imageRenderHint = zoom < 1 ? "auto" : "pixelated";
-  });
+  // ---- image rendering hint ----
+  let imageRenderHint = $derived(zoom < 1 ? "auto" : "pixelated");
 
   // ---- cursor ----
   let cursor = $derived(
@@ -47,7 +40,8 @@
   let device: GPUDevice | null = $state(null);
   let context: GPUCanvasContext | null = $state(null);
   let paintTexture: GPUTexture | null = $state(null);
-  let uniformBuffer: GPUBuffer | null = $state(null);
+  let stampBuffer: GPUBuffer | null = $state(null);
+  let viewUniformBuffer: GPUBuffer | null = $state(null);
   let computePipeline: GPUComputePipeline | null = $state(null);
   let renderPipeline: GPURenderPipeline | null = $state(null);
   let computeBindGroup: GPUBindGroup | null = $state(null);
@@ -63,6 +57,25 @@
   // ---- wheel accumulator ----
   let wheelAccum = 0;
 
+  // ---- pending stamps (batched per frame) ----
+  type PendingStamp = {
+    x: number;
+    y: number;
+    radius: number;
+    rgba: [number, number, number, number];
+  };
+  let pendingStamps: PendingStamp[] = [];
+  let maxStampW = 0;
+  let maxStampH = 0;
+  let rafId: number | null = null;
+
+  // ---- current canvas internal size (set by ResizeObserver) ----
+  let canvasWidth = $state(0);
+  let canvasHeight = $state(0);
+
+  // ---- per-frame CPU buffer for stamp data (avoid per-frame alloc) ----
+  let stampDataView: Float32Array;
+
   // ====================================================================
   //  Helpers
   // ====================================================================
@@ -76,18 +89,18 @@
     return [r, g, b, 1];
   }
 
-  function getCanvasSize() {
+  function getCanvasCSSSize() {
     return {
-      w: canvasEl?.clientWidth ?? CANVAS_WIDTH,
-      h: canvasEl?.clientHeight ?? CANVAS_HEIGHT,
+      w: canvasEl?.clientWidth ?? window.innerWidth,
+      h: canvasEl?.clientHeight ?? window.innerHeight,
     };
   }
 
   function screenToCanvas(screenX: number, screenY: number) {
-    const { w: cw, h: ch } = getCanvasSize();
+    const { w: cw, h: ch } = getCanvasCSSSize();
     return {
-      x: (screenX * CANVAS_WIDTH) / (zoom * cw),
-      y: (screenY * CANVAS_HEIGHT) / (zoom * ch),
+      x: screenX * CANVAS_WIDTH / (zoom * cw) + offsetX,
+      y: screenY * CANVAS_HEIGHT / (zoom * ch) + offsetY,
     };
   }
 
@@ -111,73 +124,119 @@
     dev.queue.submit([encoder.finish()]);
   }
 
-  function present(
-    dev: GPUDevice,
-    ctx: GPUCanvasContext,
-    pipeline: GPURenderPipeline,
-    bindGroup: GPUBindGroup,
-  ) {
-    const encoder = dev.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: ctx.getCurrentTexture().createView(),
-          loadOp: "clear",
-          clearValue: [0, 0, 0, 0],
-          storeOp: "store",
-        },
-      ],
-    });
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.draw(3);
-    pass.end();
-    dev.queue.submit([encoder.finish()]);
-  }
-
-  function stamp(
-    x: number,
-    y: number,
-    radius: number,
-    rgba: [number, number, number, number],
-  ) {
+  /**
+   * Process all queued stamps in a single compute dispatch (storage buffer)
+   * plus one render pass → one GPU submit.
+   */
+  function flushFrame() {
     if (
       !device ||
       !context ||
-      !uniformBuffer ||
+      !stampBuffer ||
+      !viewUniformBuffer ||
       !computePipeline ||
       !renderPipeline ||
       !computeBindGroup ||
       !renderBindGroup
-    )
+    ) {
+      rafId = null;
       return;
+    }
 
-    const minX = Math.max(0, Math.floor(x - radius));
-    const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(x + radius));
-    const minY = Math.max(0, Math.floor(y - radius));
-    const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(y + radius));
+    if (canvasWidth === 0 || canvasHeight === 0) {
+      rafId = null;
+      return;
+    }
 
-    if (minX > maxX || minY > maxY) return;
+    const stamps = pendingStamps;
+    const n = stamps.length;
+    pendingStamps = [];
+    const stampW = maxStampW;
+    const stampH = maxStampH;
+    maxStampW = 0;
+    maxStampH = 0;
 
-    const uniforms = new Float32Array([
-      x, y, radius, 0,
-      rgba[0], rgba[1], rgba[2], rgba[3],
-      minX, minY, maxX, maxY,
-    ]);
-    device.queue.writeBuffer(uniformBuffer, 0, uniforms);
+    if (n === 0) {
+      // No stamps — still need to render for pan/zoom updates
+      const encoder = device.createCommandEncoder();
 
-    const textureView = context.getCurrentTexture().createView();
+      // Update view uniforms
+      writeViewUniforms(device);
+
+      const textureView = context.getCurrentTexture().createView();
+      const renderPass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: textureView,
+            loadOp: "clear",
+            clearValue: [0, 0, 0, 0],
+            storeOp: "store",
+          },
+        ],
+      });
+      renderPass.setPipeline(renderPipeline);
+      renderPass.setBindGroup(0, renderBindGroup);
+      renderPass.draw(3);
+      renderPass.end();
+
+      device.queue.submit([encoder.finish()]);
+
+      if (pendingStamps.length > 0) {
+        scheduleFrame();
+      } else {
+        rafId = null;
+      }
+      return;
+    }
+
+    // Clamp to MAX_STAMPS_PER_FRAME (shouldn't happen, but safety)
+    const count = Math.min(n, MAX_STAMPS_PER_FRAME);
+
+    // Fill stamp buffer with all stamp data
+    // Each stamp is 12 f32 values (48 bytes): center.xy, radius, pad1, color, bounds
+    for (let i = 0; i < count; i++) {
+      const s = stamps[i];
+      const minX = Math.max(0, Math.floor(s.x - s.radius));
+      const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(s.x + s.radius));
+      const minY = Math.max(0, Math.floor(s.y - s.radius));
+      const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(s.y + s.radius));
+
+      const offset = i * 12;
+      stampDataView[offset + 0] = s.x;
+      stampDataView[offset + 1] = s.y;
+      stampDataView[offset + 2] = s.radius;
+      stampDataView[offset + 3] = 0; // pad1
+      stampDataView[offset + 4] = s.rgba[0];
+      stampDataView[offset + 5] = s.rgba[1];
+      stampDataView[offset + 6] = s.rgba[2];
+      stampDataView[offset + 7] = s.rgba[3];
+      stampDataView[offset + 8] = minX;
+      stampDataView[offset + 9] = minY;
+      stampDataView[offset + 10] = maxX;
+      stampDataView[offset + 11] = maxY;
+    }
+
+    // Single write of all stamp data
+    device.queue.writeBuffer(stampBuffer, 0, stampDataView, 0, count * 12);
+
+    // Update view uniforms
+    writeViewUniforms(device);
+
     const encoder = device.createCommandEncoder();
 
+    // Single compute pass, one 3D dispatch
     const computePass = encoder.beginComputePass();
     computePass.setPipeline(computePipeline);
     computePass.setBindGroup(0, computeBindGroup);
     computePass.dispatchWorkgroups(
-      Math.ceil((maxX - minX + 1) / 8),
-      Math.ceil((maxY - minY + 1) / 8),
+      Math.max(1, Math.ceil(stampW / 8)),
+      Math.max(1, Math.ceil(stampH / 8)),
+      count,
     );
     computePass.end();
 
+    // Single render pass
+    const textureView = context.getCurrentTexture().createView();
     const renderPass = encoder.beginRenderPass({
       colorAttachments: [
         {
@@ -194,6 +253,51 @@
     renderPass.end();
 
     device.queue.submit([encoder.finish()]);
+
+    // Continue if more stamps arrived during processing
+    if (pendingStamps.length > 0) {
+      scheduleFrame();
+    } else {
+      rafId = null;
+    }
+  }
+
+  function writeViewUniforms(dev: GPUDevice) {
+    const viewUniforms = new Float32Array([
+      CANVAS_WIDTH / (zoom * canvasWidth),
+      CANVAS_HEIGHT / (zoom * canvasHeight),
+      offsetX,
+      offsetY,
+      CANVAS_WIDTH,
+      CANVAS_HEIGHT,
+      0, 0, // padding to 32 bytes (16-byte alignment)
+    ]);
+    dev.queue.writeBuffer(viewUniformBuffer!, 0, viewUniforms);
+  }
+
+  function scheduleFrame() {
+    if (rafId !== null) return;
+    rafId = requestAnimationFrame(flushFrame);
+  }
+
+  function queueStamp(
+    x: number,
+    y: number,
+    radius: number,
+    rgba: [number, number, number, number],
+  ) {
+    const minX = Math.max(0, Math.floor(x - radius));
+    const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(x + radius));
+    const minY = Math.max(0, Math.floor(y - radius));
+    const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(y + radius));
+
+    const w = maxX - minX + 1;
+    const h = maxY - minY + 1;
+
+    pendingStamps.push({ x, y, radius, rgba });
+    if (w > maxStampW) maxStampW = w;
+    if (h > maxStampH) maxStampH = h;
+    scheduleFrame();
   }
 
   function stampLine(
@@ -207,14 +311,20 @@
     const dx = x2 - x1;
     const dy = y2 - y1;
     const dist = Math.hypot(dx, dy);
-    if (dist === 0) return;
+    if (dist === 0) {
+      queueStamp(x1, y1, radius, rgba);
+      return;
+    }
+
+    // Include the starting point for gapless chaining
+    queueStamp(x1, y1, radius, rgba);
 
     const step = Math.max(1, radius * 0.5);
     const steps = Math.ceil(dist / step);
 
     for (let i = 1; i <= steps; i++) {
       const t = i / steps;
-      stamp(x1 + dx * t, y1 + dy * t, radius, rgba);
+      queueStamp(x1 + dx * t, y1 + dy * t, radius, rgba);
     }
   }
 
@@ -269,11 +379,23 @@
         minFilter: "nearest",
       });
 
-      const ubo = dev.createBuffer({
-        size: 48,
+      // Storage buffer for stamp data (12 f32 × MAX_STAMPS_PER_FRAME)
+      const brushBufSize = 12 * MAX_STAMPS_PER_FRAME * 4; // f32 = 4 bytes
+      const brushBuf = dev.createBuffer({
+        size: brushBufSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+
+      // Pre-allocate CPU-side view for filling stamp data
+      stampDataView = new Float32Array(12 * MAX_STAMPS_PER_FRAME);
+
+      // View uniforms (32 bytes)
+      const viewUbo = dev.createBuffer({
+        size: 32,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
 
+      // ---- Compute pipeline (stamp) ----
       const computeBindGroupLayout = dev.createBindGroupLayout({
         entries: [
           {
@@ -288,7 +410,7 @@
           {
             binding: 1,
             visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "uniform" },
+            buffer: { type: "read-only-storage" },
           },
         ],
       });
@@ -307,14 +429,16 @@
         layout: computeBindGroupLayout,
         entries: [
           { binding: 0, resource: paintTex.createView() },
-          { binding: 1, resource: { buffer: ubo } },
+          { binding: 1, resource: { buffer: brushBuf } },
         ],
       });
 
+      // ---- Render pipeline (blit) ----
       const renderBindGroupLayout = dev.createBindGroupLayout({
         entries: [
           { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
           { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         ],
       });
 
@@ -339,6 +463,7 @@
         entries: [
           { binding: 0, resource: sampler },
           { binding: 1, resource: paintTex.createView() },
+          { binding: 2, resource: { buffer: viewUbo } },
         ],
       });
 
@@ -346,14 +471,19 @@
       device = dev;
       context = ctx;
       paintTexture = paintTex;
-      uniformBuffer = ubo;
+      stampBuffer = brushBuf;
+      viewUniformBuffer = viewUbo;
       computePipeline = compPipeline;
       renderPipeline = rndrPipeline;
       computeBindGroup = compBindGroup;
       renderBindGroup = rndrBindGroup;
 
       clearToGray(dev, paintTex);
-      present(dev, ctx, rndrPipeline, rndrBindGroup);
+
+      // Initial present
+      if (canvasWidth > 0 && canvasHeight > 0) {
+        scheduleFrame();
+      }
     }
 
     init().catch((e) => {
@@ -364,8 +494,43 @@
     return () => {
       cancelled = true;
       paintTexture?.destroy();
-      uniformBuffer?.destroy();
+      stampBuffer?.destroy();
+      viewUniformBuffer?.destroy();
     };
+  });
+
+  // ====================================================================
+  //  Canvas resize via ResizeObserver
+  // ====================================================================
+
+  $effect(() => {
+    const canvas = canvasEl;
+    if (!canvas) return;
+
+    const dpr = window.devicePixelRatio || 1;
+
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = Math.round(entry.contentRect.width * dpr);
+        const h = Math.round(entry.contentRect.height * dpr);
+        if (w === 0 || h === 0) continue;
+
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+          canvasWidth = w;
+          canvasHeight = h;
+
+          if (device && context && renderPipeline && renderBindGroup) {
+            scheduleFrame();
+          }
+        }
+      }
+    });
+
+    observer.observe(canvas);
+
+    return () => observer.disconnect();
   });
 
   // ====================================================================
@@ -377,13 +542,15 @@
     const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, oldZoom * factor));
     if (newZoom === oldZoom) return;
 
-    const { w: cw, h: ch } = getCanvasSize();
+    const { w: cw, h: ch } = getCanvasCSSSize();
     const newOffsetX = offsetX + cursorX * CANVAS_WIDTH / cw * (1 / oldZoom - 1 / newZoom);
     const newOffsetY = offsetY + cursorY * CANVAS_HEIGHT / ch * (1 / oldZoom - 1 / newZoom);
 
     zoom = newZoom;
     offsetX = newOffsetX;
     offsetY = newOffsetY;
+
+    scheduleFrame();
   }
 
   function fitToScreen() {
@@ -428,7 +595,6 @@
     const canvas = canvasEl;
     if (!canvas) return;
 
-    // Middle-mouse or Space + Left → pan
     if (e.button === 1 || (e.button === 0 && isSpaceHeld)) {
       isPanning = true;
       panStart = {
@@ -441,7 +607,6 @@
       return;
     }
 
-    // Left mouse → draw
     if (e.button === 0) {
       isDrawing = true;
       const rect = canvas.getBoundingClientRect();
@@ -451,23 +616,22 @@
       lastPos = { x, y };
 
       const radius = getRadius(e);
-      stamp(x, y, radius, hexToVec4(color));
+      queueStamp(x, y, radius, hexToVec4(color));
       canvas.setPointerCapture(e.pointerId);
     }
   }
 
   function handlePointerMove(e: PointerEvent) {
-    // ---- panning ----
     if (isPanning) {
       const dx = e.clientX - panStart.clientX;
       const dy = e.clientY - panStart.clientY;
-      const { w: cw, h: ch } = getCanvasSize();
+      const { w: cw, h: ch } = getCanvasCSSSize();
       offsetX = panStart.offsetX - dx * CANVAS_WIDTH / (zoom * cw);
       offsetY = panStart.offsetY - dy * CANVAS_HEIGHT / (zoom * ch);
+      scheduleFrame();
       return;
     }
 
-    // ---- drawing ----
     if (!isDrawing) return;
 
     const canvas = canvasEl;
@@ -497,12 +661,8 @@
     isDrawing = false;
   }
 
-  // ====================================================================
-  //  Pen pressure — works natively in Electron/Chromium!
-  // ====================================================================
   function getRadius(e: PointerEvent): number {
     const p = e.pressure;
-    // Mouse always reports 0.5; pen reports 0–1
     if (typeof p === "number" && p !== 0.5 && p > 0.01) {
       return brushSize * Math.max(0.05, p) / 2;
     }
@@ -577,9 +737,7 @@
   <canvas
     bind:this={canvasEl}
     class="block h-screen w-screen bg-neutral-400"
-    style="transform-origin: 0 0; transform: {canvasTransform}; image-rendering: {imageRenderHint}; cursor: {cursor}"
-    width={CANVAS_WIDTH}
-    height={CANVAS_HEIGHT}
+    style="image-rendering: {imageRenderHint}; cursor: {cursor}"
     onwheel={handleWheel}
     onpointerdown={handlePointerDown}
     onpointermove={handlePointerMove}
