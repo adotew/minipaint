@@ -1,0 +1,11 @@
+appId: com.minipaint.app
+productName: minipaint
+directories:
+  output: release
+files:
+  - dist/**/*
+  - electron/**/*
+  - package.json
+mac:
+  target: dmg
+  category: public.app-category.graphics-design

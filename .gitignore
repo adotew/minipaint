@@ -37,6 +37,9 @@ coverage/
 .pnp.*
 .bun/
 
+# Electron build output
+release/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
