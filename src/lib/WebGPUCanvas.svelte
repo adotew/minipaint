@@ -11,8 +11,8 @@
 
   let { color, brushSize }: Props = $props();
 
-  const CANVAS_WIDTH = 4000;
-  const CANVAS_HEIGHT = 4000;
+  const CANVAS_WIDTH = 2000;
+  const CANVAS_HEIGHT = 2000;
   const MIN_ZOOM = 0.01;
   const MAX_ZOOM = 32;
   const MAX_STAMPS_PER_FRAME = 1024;
@@ -22,9 +22,12 @@
   let error = $state<string | null>(null);
 
   // ---- zoom / pan state ----
+  // zoom is CSS pixels per paint pixel. offset is the paint-space
+  // coordinate currently shown at the viewport's top-left.
   let zoom = $state(1);
   let offsetX = $state(0);
   let offsetY = $state(0);
+  let hasFitInitialView = false;
   let isPanning = $state(false);
   let isSpaceHeld = $state(false);
 
@@ -89,18 +92,10 @@
     return [r, g, b, 1];
   }
 
-  function getCanvasCSSSize() {
-    return {
-      w: canvasEl?.clientWidth ?? window.innerWidth,
-      h: canvasEl?.clientHeight ?? window.innerHeight,
-    };
-  }
-
   function screenToCanvas(screenX: number, screenY: number) {
-    const { w: cw, h: ch } = getCanvasCSSSize();
     return {
-      x: screenX * CANVAS_WIDTH / (zoom * cw) + offsetX,
-      y: screenY * CANVAS_HEIGHT / (zoom * ch) + offsetY,
+      x: screenX / zoom + offsetX,
+      y: screenY / zoom + offsetY,
     };
   }
 
@@ -108,14 +103,14 @@
   //  WebGPU helpers
   // ====================================================================
 
-  function clearToGray(dev: GPUDevice, tex: GPUTexture) {
+  function clearPaintToWhite(dev: GPUDevice, tex: GPUTexture) {
     const encoder = dev.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
           view: tex.createView(),
           loadOp: "clear",
-          clearValue: [0.5, 0.5, 0.5, 1],
+          clearValue: [1, 1, 1, 1],
           storeOp: "store",
         },
       ],
@@ -169,7 +164,7 @@
           {
             view: textureView,
             loadOp: "clear",
-            clearValue: [0, 0, 0, 0],
+            clearValue: [0.5, 0.5, 0.5, 1],
             storeOp: "store",
           },
         ],
@@ -189,8 +184,20 @@
       return;
     }
 
-    // Clamp to MAX_STAMPS_PER_FRAME (shouldn't happen, but safety)
+    // Clamp to MAX_STAMPS_PER_FRAME and keep overflow for the next frame.
     const count = Math.min(n, MAX_STAMPS_PER_FRAME);
+    if (n > count) {
+      const overflow = stamps.slice(count);
+      pendingStamps = overflow.concat(pendingStamps);
+      for (const s of overflow) {
+        const minX = Math.max(0, Math.floor(s.x - s.radius));
+        const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(s.x + s.radius));
+        const minY = Math.max(0, Math.floor(s.y - s.radius));
+        const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(s.y + s.radius));
+        maxStampW = Math.max(maxStampW, maxX - minX + 1);
+        maxStampH = Math.max(maxStampH, maxY - minY + 1);
+      }
+    }
 
     // Fill stamp buffer with all stamp data
     // Each stamp is 12 f32 values (48 bytes): center.xy, radius, pad1, color, bounds
@@ -242,7 +249,7 @@
         {
           view: textureView,
           loadOp: "clear",
-          clearValue: [0, 0, 0, 0],
+          clearValue: [0.5, 0.5, 0.5, 1],
           storeOp: "store",
         },
       ],
@@ -263,9 +270,12 @@
   }
 
   function writeViewUniforms(dev: GPUDevice) {
+    const cssWidth = canvasEl?.clientWidth ?? canvasWidth;
+    const cssHeight = canvasEl?.clientHeight ?? canvasHeight;
+
     const viewUniforms = new Float32Array([
-      CANVAS_WIDTH / (zoom * canvasWidth),
-      CANVAS_HEIGHT / (zoom * canvasHeight),
+      cssWidth / (canvasWidth * zoom),
+      cssHeight / (canvasHeight * zoom),
       offsetX,
       offsetY,
       CANVAS_WIDTH,
@@ -286,10 +296,21 @@
     radius: number,
     rgba: [number, number, number, number],
   ) {
+    if (
+      x + radius < 0 ||
+      y + radius < 0 ||
+      x - radius >= CANVAS_WIDTH ||
+      y - radius >= CANVAS_HEIGHT
+    ) {
+      return;
+    }
+
     const minX = Math.max(0, Math.floor(x - radius));
     const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(x + radius));
     const minY = Math.max(0, Math.floor(y - radius));
     const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(y + radius));
+
+    if (maxX < minX || maxY < minY) return;
 
     const w = maxX - minX + 1;
     const h = maxY - minY + 1;
@@ -478,7 +499,7 @@
       computeBindGroup = compBindGroup;
       renderBindGroup = rndrBindGroup;
 
-      clearToGray(dev, paintTex);
+      clearPaintToWhite(dev, paintTex);
 
       // Initial present
       if (canvasWidth > 0 && canvasHeight > 0) {
@@ -521,7 +542,10 @@
           canvasWidth = w;
           canvasHeight = h;
 
-          if (device && context && renderPipeline && renderBindGroup) {
+          if (!hasFitInitialView) {
+            hasFitInitialView = true;
+            fitToScreen();
+          } else if (device && context && renderPipeline && renderBindGroup) {
             scheduleFrame();
           }
         }
@@ -542,9 +566,8 @@
     const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, oldZoom * factor));
     if (newZoom === oldZoom) return;
 
-    const { w: cw, h: ch } = getCanvasCSSSize();
-    const newOffsetX = offsetX + cursorX * CANVAS_WIDTH / cw * (1 / oldZoom - 1 / newZoom);
-    const newOffsetY = offsetY + cursorY * CANVAS_HEIGHT / ch * (1 / oldZoom - 1 / newZoom);
+    const newOffsetX = offsetX + cursorX * (1 / oldZoom - 1 / newZoom);
+    const newOffsetY = offsetY + cursorY * (1 / oldZoom - 1 / newZoom);
 
     zoom = newZoom;
     offsetX = newOffsetX;
@@ -558,18 +581,20 @@
     if (!canvas) return;
     const vw = canvas.clientWidth;
     const vh = canvas.clientHeight;
-    const scale = Math.min(vw / CANVAS_WIDTH, vh / CANVAS_HEIGHT, 1);
-    const ox = (CANVAS_WIDTH - vw / scale) / 2;
-    const oy = (CANVAS_HEIGHT - vh / scale) / 2;
+    const scale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min(vw / CANVAS_WIDTH, vh / CANVAS_HEIGHT)));
+    const visibleWidth = vw / scale;
+    const visibleHeight = vh / scale;
     zoom = scale;
-    offsetX = -ox;
-    offsetY = -oy;
+    offsetX = (CANVAS_WIDTH - visibleWidth) / 2;
+    offsetY = (CANVAS_HEIGHT - visibleHeight) / 2;
+    scheduleFrame();
   }
 
   function zoomTo100() {
     zoom = 1;
     offsetX = 0;
     offsetY = 0;
+    scheduleFrame();
   }
 
   // ====================================================================
@@ -625,9 +650,8 @@
     if (isPanning) {
       const dx = e.clientX - panStart.clientX;
       const dy = e.clientY - panStart.clientY;
-      const { w: cw, h: ch } = getCanvasCSSSize();
-      offsetX = panStart.offsetX - dx * CANVAS_WIDTH / (zoom * cw);
-      offsetY = panStart.offsetY - dy * CANVAS_HEIGHT / (zoom * ch);
+      offsetX = panStart.offsetX - dx / zoom;
+      offsetY = panStart.offsetY - dy / zoom;
       scheduleFrame();
       return;
     }
@@ -736,7 +760,7 @@
 
   <canvas
     bind:this={canvasEl}
-    class="block h-screen w-screen bg-neutral-800"
+    class="block h-screen w-screen bg-neutral-500"
     style="image-rendering: {imageRenderHint}; cursor: {cursor}"
     onwheel={handleWheel}
     onpointerdown={handlePointerDown}

@@ -17,7 +17,7 @@
       id="brush-size"
       type="range"
       min={1}
-      max={100}
+      max={500}
       value={brushSize}
       oninput={(e) => (brushSize = Number(e.currentTarget.value))}
       class="w-full accent-zinc-100"
