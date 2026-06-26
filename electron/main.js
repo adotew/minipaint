@@ -9,6 +9,11 @@ function createWindow() {
     width: 1280,
     height: 800,
     title: "minipaint",
+    // macOS: hide the native title bar but keep the traffic-light buttons.
+    // The web content then shows through behind the window controls.
+    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
+    trafficLightPosition: process.platform === "darwin" ? { x: 14, y: 14 } : undefined,
+    backgroundColor: "#00000000",
     webPreferences: {
       // No node integration — the renderer stays a pure browser context
       nodeIntegration: false,
