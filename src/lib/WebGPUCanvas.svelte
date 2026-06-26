@@ -11,11 +11,14 @@
 
   let { color, brushSize }: Props = $props();
 
-  const CANVAS_WIDTH = 2000;
-  const CANVAS_HEIGHT = 2000;
+  const CANVAS_WIDTH = 4000;
+  const CANVAS_HEIGHT = 4000;
   const MIN_ZOOM = 0.01;
   const MAX_ZOOM = 32;
   const MAX_STAMPS_PER_FRAME = 1024;
+  const MIN_PRESSURE = 0.05;
+  const PRESSURE_FALLBACK = 0.5;
+  const PRESSURE_EPSILON = 0.001;
 
   // ---- DOM binding ----
   let canvasEl: HTMLCanvasElement | undefined = $state();
@@ -36,8 +39,13 @@
 
   // ---- cursor ----
   let cursor = $derived(
-    isPanning ? "grabbing" : isSpaceHeld ? "grab" : "crosshair"
+    isPanning ? "grabbing" : isSpaceHeld ? "grab" : "none"
   );
+  let brushPreviewVisible = $state(false);
+  let brushPreviewX = $state(0);
+  let brushPreviewY = $state(0);
+  let brushPreviewRadius = $state(0);
+  let brushPreviewSize = $derived(Math.max(1, brushPreviewRadius * 2 * zoom));
 
   // ---- WebGPU refs ----
   let device: GPUDevice | null = $state(null);
@@ -52,7 +60,8 @@
 
   // ---- drawing state ----
   let isDrawing = false;
-  let lastPos = { x: 0, y: 0 };
+  let strokeUsesPressure = false;
+  let lastPoint = { x: 0, y: 0, radius: 0 };
 
   // ---- pan tracking ----
   let panStart = { clientX: 0, clientY: 0, offsetX: 0, offsetY: 0 };
@@ -324,27 +333,29 @@
   function stampLine(
     x1: number,
     y1: number,
+    r1: number,
     x2: number,
     y2: number,
-    radius: number,
+    r2: number,
     rgba: [number, number, number, number],
   ) {
     const dx = x2 - x1;
     const dy = y2 - y1;
     const dist = Math.hypot(dx, dy);
     if (dist === 0) {
-      queueStamp(x1, y1, radius, rgba);
+      queueStamp(x1, y1, r2, rgba);
       return;
     }
 
     // Include the starting point for gapless chaining
-    queueStamp(x1, y1, radius, rgba);
+    queueStamp(x1, y1, r1, rgba);
 
-    const step = Math.max(1, radius * 0.5);
+    const step = Math.max(1, Math.max(r1, r2) * 0.5);
     const steps = Math.ceil(dist / step);
 
     for (let i = 1; i <= steps; i++) {
       const t = i / steps;
+      const radius = r1 + (r2 - r1) * t;
       queueStamp(x1 + dx * t, y1 + dy * t, radius, rgba);
     }
   }
@@ -620,7 +631,10 @@
     const canvas = canvasEl;
     if (!canvas) return;
 
+    updateBrushPreview(e);
+
     if (e.button === 1 || (e.button === 0 && isSpaceHeld)) {
+      brushPreviewVisible = false;
       isPanning = true;
       panStart = {
         clientX: e.clientX,
@@ -634,29 +648,36 @@
 
     if (e.button === 0) {
       isDrawing = true;
+      strokeUsesPressure = hasRealPressure(e);
       const rect = canvas.getBoundingClientRect();
       const screenX = e.clientX - rect.left;
       const screenY = e.clientY - rect.top;
       const { x, y } = screenToCanvas(screenX, screenY);
-      lastPos = { x, y };
-
-      const radius = getRadius(e);
+      const radius = getRadius(e, brushSize * MIN_PRESSURE / 2);
+      lastPoint = { x, y, radius };
       queueStamp(x, y, radius, hexToVec4(color));
       canvas.setPointerCapture(e.pointerId);
     }
   }
 
   function handlePointerMove(e: PointerEvent) {
+    updateBrushPreview(e);
+
     if (isPanning) {
       const dx = e.clientX - panStart.clientX;
       const dy = e.clientY - panStart.clientY;
       offsetX = panStart.offsetX - dx / zoom;
       offsetY = panStart.offsetY - dy / zoom;
       scheduleFrame();
+      brushPreviewVisible = false;
       return;
     }
 
     if (!isDrawing) return;
+
+    if (!strokeUsesPressure && hasRealPressure(e)) {
+      strokeUsesPressure = true;
+    }
 
     const canvas = canvasEl;
     if (!canvas) return;
@@ -666,14 +687,16 @@
     const screenY = e.clientY - rect.top;
     const { x, y } = screenToCanvas(screenX, screenY);
 
-    const radius = getRadius(e);
-    stampLine(lastPos.x, lastPos.y, x, y, radius, hexToVec4(color));
-    lastPos = { x, y };
+    const radius = getRadius(e, lastPoint.radius || brushSize * MIN_PRESSURE / 2);
+    stampLine(lastPoint.x, lastPoint.y, lastPoint.radius, x, y, radius, hexToVec4(color));
+    lastPoint = { x, y, radius };
   }
 
   function handlePointerUp(e: PointerEvent) {
     isDrawing = false;
     isPanning = false;
+    strokeUsesPressure = false;
+    updateBrushPreview(e);
     try {
       canvasEl?.releasePointerCapture(e.pointerId);
     } catch {
@@ -683,14 +706,53 @@
 
   function handlePointerLeave() {
     isDrawing = false;
+    strokeUsesPressure = false;
+    brushPreviewVisible = false;
   }
 
-  function getRadius(e: PointerEvent): number {
-    const p = e.pressure;
-    if (typeof p === "number" && p !== 0.5 && p > 0.01) {
-      return brushSize * Math.max(0.05, p) / 2;
+  function updateBrushPreview(e: PointerEvent) {
+    const canvas = canvasEl;
+    if (!canvas || isPanning || isSpaceHeld) {
+      brushPreviewVisible = false;
+      return;
     }
+
+    const rect = canvas.getBoundingClientRect();
+    brushPreviewX = e.clientX - rect.left;
+    brushPreviewY = e.clientY - rect.top;
+    brushPreviewRadius = getPreviewRadius(e);
+    brushPreviewVisible = true;
+  }
+
+  function getPreviewRadius(e: PointerEvent): number {
+    // Hover always previews the lowest pressure size.
+    if (!isDrawing) {
+      return brushSize * MIN_PRESSURE / 2;
+    }
+
+    if (strokeUsesPressure) {
+      return getRadius(e, brushPreviewRadius || brushSize * MIN_PRESSURE / 2);
+    }
+
     return brushSize / 2;
+  }
+
+  function hasRealPressure(e: PointerEvent): boolean {
+    const p = typeof e.pressure === "number" ? e.pressure : 0;
+    return e.pointerType === "pen" || (p > 0 && Math.abs(p - PRESSURE_FALLBACK) > PRESSURE_EPSILON);
+  }
+
+  function getRadius(e: PointerEvent, fallbackRadius: number): number {
+    if (!strokeUsesPressure) {
+      return brushSize / 2;
+    }
+
+    const p = typeof e.pressure === "number" ? e.pressure : 0;
+    if (p > 0) {
+      return brushSize * Math.max(MIN_PRESSURE, Math.min(1, p)) / 2;
+    }
+
+    return fallbackRadius;
   }
 
   // ====================================================================
@@ -769,6 +831,13 @@
     onpointerleave={handlePointerLeave}
     oncontextmenu={(e: MouseEvent) => e.preventDefault()}
   ></canvas>
+
+  {#if brushPreviewVisible}
+    <div
+      class="pointer-events-none absolute rounded-full border border-white/90 shadow-[0_0_0_1px_rgba(0,0,0,0.55)]"
+      style="left: {brushPreviewX}px; top: {brushPreviewY}px; width: {brushPreviewSize}px; height: {brushPreviewSize}px; transform: translate(-50%, -50%);"
+    ></div>
+  {/if}
 
   <div class="pointer-events-none absolute bottom-2 right-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white/90 font-mono">
     {Math.round(zoom * 100)}%
