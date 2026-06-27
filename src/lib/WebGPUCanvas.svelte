@@ -16,7 +16,7 @@
   const MIN_ZOOM = 0.01;
   const MAX_ZOOM = 32;
   const MAX_STAMPS_PER_FRAME = 1024;
-  const MIN_PRESSURE = 0.05;
+  const MIN_PRESSURE_SIZE = 0.45;
   const PRESSURE_FALLBACK = 0.5;
   const PRESSURE_EPSILON = 0.001;
 
@@ -653,7 +653,7 @@
       const screenX = e.clientX - rect.left;
       const screenY = e.clientY - rect.top;
       const { x, y } = screenToCanvas(screenX, screenY);
-      const radius = getRadius(e, brushSize * MIN_PRESSURE / 2);
+      const radius = getRadius(e, brushSize * MIN_PRESSURE_SIZE / 2);
       lastPoint = { x, y, radius };
       queueStamp(x, y, radius, hexToVec4(color));
       canvas.setPointerCapture(e.pointerId);
@@ -687,7 +687,7 @@
     const screenY = e.clientY - rect.top;
     const { x, y } = screenToCanvas(screenX, screenY);
 
-    const radius = getRadius(e, lastPoint.radius || brushSize * MIN_PRESSURE / 2);
+    const radius = getRadius(e, lastPoint.radius || brushSize * MIN_PRESSURE_SIZE / 2);
     stampLine(lastPoint.x, lastPoint.y, lastPoint.radius, x, y, radius, hexToVec4(color));
     lastPoint = { x, y, radius };
   }
@@ -727,11 +727,11 @@
   function getPreviewRadius(e: PointerEvent): number {
     // Hover always previews the lowest pressure size.
     if (!isDrawing) {
-      return brushSize * MIN_PRESSURE / 2;
+      return brushSize * MIN_PRESSURE_SIZE / 2;
     }
 
     if (strokeUsesPressure) {
-      return getRadius(e, brushPreviewRadius || brushSize * MIN_PRESSURE / 2);
+      return getRadius(e, brushPreviewRadius || brushSize * MIN_PRESSURE_SIZE / 2);
     }
 
     return brushSize / 2;
@@ -749,7 +749,8 @@
 
     const p = typeof e.pressure === "number" ? e.pressure : 0;
     if (p > 0) {
-      return brushSize * Math.max(MIN_PRESSURE, Math.min(1, p)) / 2;
+      const pressureScale = MIN_PRESSURE_SIZE + (1 - MIN_PRESSURE_SIZE) * Math.min(1, p);
+      return brushSize * pressureScale / 2;
     }
 
     return fallbackRadius;
