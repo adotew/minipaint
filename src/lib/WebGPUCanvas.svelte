@@ -3,6 +3,8 @@
 
   import stampShaderCode from "./shaders/stamp.wgsl?raw";
   import blitShaderCode from "./shaders/blit.wgsl?raw";
+  import brushStampUrl from "../assets/brush-stamp.png";
+  import brushStampOutlineUrl from "../assets/brush-stamp-outline.png";
 
   interface Props {
     color: string;
@@ -17,6 +19,7 @@
   const MAX_ZOOM = 32;
   const MAX_STAMPS_PER_FRAME = 1024;
   const MIN_PRESSURE_SIZE = 0.45;
+  const BRUSH_STAMP_ASPECT = 982 / 561;
   const PRESSURE_FALLBACK = 0.5;
   const PRESSURE_EPSILON = 0.001;
 
@@ -45,12 +48,14 @@
   let brushPreviewX = $state(0);
   let brushPreviewY = $state(0);
   let brushPreviewRadius = $state(0);
-  let brushPreviewSize = $derived(Math.max(1, brushPreviewRadius * 2 * zoom));
+  let brushPreviewWidth = $derived(Math.max(1, getStampHalfSize(brushPreviewRadius).halfWidth * 2 * zoom));
+  let brushPreviewHeight = $derived(Math.max(1, getStampHalfSize(brushPreviewRadius).halfHeight * 2 * zoom));
 
   // ---- WebGPU refs ----
   let device: GPUDevice | null = $state(null);
   let context: GPUCanvasContext | null = $state(null);
   let paintTexture: GPUTexture | null = $state(null);
+  let brushStampTexture: GPUTexture | null = $state(null);
   let stampBuffer: GPUBuffer | null = $state(null);
   let viewUniformBuffer: GPUBuffer | null = $state(null);
   let computePipeline: GPUComputePipeline | null = $state(null);
@@ -106,6 +111,39 @@
       x: screenX / zoom + offsetX,
       y: screenY / zoom + offsetY,
     };
+  }
+
+  function getStampHalfSize(radius: number) {
+    if (BRUSH_STAMP_ASPECT >= 1) {
+      return { halfWidth: radius, halfHeight: radius / BRUSH_STAMP_ASPECT };
+    }
+
+    return { halfWidth: radius * BRUSH_STAMP_ASPECT, halfHeight: radius };
+  }
+
+  function getStampBounds(x: number, y: number, radius: number) {
+    const { halfWidth, halfHeight } = getStampHalfSize(radius);
+    const minX = Math.max(0, Math.floor(x - halfWidth));
+    const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(x + halfWidth));
+    const minY = Math.max(0, Math.floor(y - halfHeight));
+    const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(y + halfHeight));
+
+    return {
+      minX,
+      maxX,
+      minY,
+      maxY,
+      width: maxX - minX + 1,
+      height: maxY - minY + 1,
+      halfWidth,
+      halfHeight,
+    };
+  }
+
+  async function loadBrushStampBitmap() {
+    const response = await fetch(brushStampUrl);
+    const blob = await response.blob();
+    return createImageBitmap(blob);
   }
 
   // ====================================================================
@@ -199,12 +237,9 @@
       const overflow = stamps.slice(count);
       pendingStamps = overflow.concat(pendingStamps);
       for (const s of overflow) {
-        const minX = Math.max(0, Math.floor(s.x - s.radius));
-        const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(s.x + s.radius));
-        const minY = Math.max(0, Math.floor(s.y - s.radius));
-        const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(s.y + s.radius));
-        maxStampW = Math.max(maxStampW, maxX - minX + 1);
-        maxStampH = Math.max(maxStampH, maxY - minY + 1);
+        const bounds = getStampBounds(s.x, s.y, s.radius);
+        maxStampW = Math.max(maxStampW, bounds.width);
+        maxStampH = Math.max(maxStampH, bounds.height);
       }
     }
 
@@ -212,10 +247,7 @@
     // Each stamp is 12 f32 values (48 bytes): center.xy, radius, pad1, color, bounds
     for (let i = 0; i < count; i++) {
       const s = stamps[i];
-      const minX = Math.max(0, Math.floor(s.x - s.radius));
-      const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(s.x + s.radius));
-      const minY = Math.max(0, Math.floor(s.y - s.radius));
-      const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(s.y + s.radius));
+      const { minX, maxX, minY, maxY } = getStampBounds(s.x, s.y, s.radius);
 
       const offset = i * 12;
       stampDataView[offset + 0] = s.x;
@@ -305,28 +337,22 @@
     radius: number,
     rgba: [number, number, number, number],
   ) {
+    const { minX, maxX, minY, maxY, width, height, halfWidth, halfHeight } = getStampBounds(x, y, radius);
+
     if (
-      x + radius < 0 ||
-      y + radius < 0 ||
-      x - radius >= CANVAS_WIDTH ||
-      y - radius >= CANVAS_HEIGHT
+      x + halfWidth < 0 ||
+      y + halfHeight < 0 ||
+      x - halfWidth >= CANVAS_WIDTH ||
+      y - halfHeight >= CANVAS_HEIGHT ||
+      maxX < minX ||
+      maxY < minY
     ) {
       return;
     }
 
-    const minX = Math.max(0, Math.floor(x - radius));
-    const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(x + radius));
-    const minY = Math.max(0, Math.floor(y - radius));
-    const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(y + radius));
-
-    if (maxX < minX || maxY < minY) return;
-
-    const w = maxX - minX + 1;
-    const h = maxY - minY + 1;
-
     pendingStamps.push({ x, y, radius, rgba });
-    if (w > maxStampW) maxStampW = w;
-    if (h > maxStampH) maxStampH = h;
+    if (width > maxStampW) maxStampW = width;
+    if (height > maxStampH) maxStampH = height;
     scheduleFrame();
   }
 
@@ -406,6 +432,29 @@
           GPUTextureUsage.RENDER_ATTACHMENT,
       });
 
+      const brushBitmap = await loadBrushStampBitmap();
+      if (cancelled) {
+        brushBitmap.close?.();
+        paintTex.destroy();
+        dev.destroy();
+        return;
+      }
+
+      const brushTex = dev.createTexture({
+        size: [brushBitmap.width, brushBitmap.height],
+        format: "rgba8unorm",
+        usage:
+          GPUTextureUsage.TEXTURE_BINDING |
+          GPUTextureUsage.COPY_DST |
+          GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      dev.queue.copyExternalImageToTexture(
+        { source: brushBitmap },
+        { texture: brushTex },
+        [brushBitmap.width, brushBitmap.height],
+      );
+      brushBitmap.close?.();
+
       const sampler = dev.createSampler({
         magFilter: "nearest",
         minFilter: "nearest",
@@ -444,6 +493,11 @@
             visibility: GPUShaderStage.COMPUTE,
             buffer: { type: "read-only-storage" },
           },
+          {
+            binding: 2,
+            visibility: GPUShaderStage.COMPUTE,
+            texture: { sampleType: "float", viewDimension: "2d" },
+          },
         ],
       });
 
@@ -462,6 +516,7 @@
         entries: [
           { binding: 0, resource: paintTex.createView() },
           { binding: 1, resource: { buffer: brushBuf } },
+          { binding: 2, resource: brushTex.createView() },
         ],
       });
 
@@ -503,6 +558,7 @@
       device = dev;
       context = ctx;
       paintTexture = paintTex;
+      brushStampTexture = brushTex;
       stampBuffer = brushBuf;
       viewUniformBuffer = viewUbo;
       computePipeline = compPipeline;
@@ -526,6 +582,7 @@
     return () => {
       cancelled = true;
       paintTexture?.destroy();
+      brushStampTexture?.destroy();
       stampBuffer?.destroy();
       viewUniformBuffer?.destroy();
     };
@@ -835,9 +892,14 @@
 
   {#if brushPreviewVisible}
     <div
-      class="pointer-events-none absolute rounded-full border border-white/90 shadow-[0_0_0_1px_rgba(0,0,0,0.55)]"
-      style="left: {brushPreviewX}px; top: {brushPreviewY}px; width: {brushPreviewSize}px; height: {brushPreviewSize}px; transform: translate(-50%, -50%);"
-    ></div>
+      class="pointer-events-none absolute"
+      style="left: {brushPreviewX}px; top: {brushPreviewY}px; width: {brushPreviewWidth}px; height: {brushPreviewHeight}px; transform: translate(-50%, -50%);"
+    >
+      <div
+        class="absolute inset-0"
+        style="background: rgba(255, 255, 255, 0.01); -webkit-backdrop-filter: invert(1); backdrop-filter: invert(1); -webkit-mask: url('{brushStampOutlineUrl}') center / contain no-repeat; mask: url('{brushStampOutlineUrl}') center / contain no-repeat;"
+      ></div>
+    </div>
   {/if}
 
   <div class="pointer-events-none absolute bottom-2 right-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white/90 font-mono">
