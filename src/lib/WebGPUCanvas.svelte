@@ -111,6 +111,10 @@
     return [r, g, b, 1];
   }
 
+  function clamp(n: number, min: number, max: number) {
+    return Math.max(min, Math.min(max, n));
+  }
+
   function screenToCanvas(screenX: number, screenY: number) {
     return {
       x: screenX / zoom + offsetX,
