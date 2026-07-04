@@ -19,7 +19,7 @@
   const MAX_ZOOM = 32;
   const MAX_STAMPS_PER_FRAME = 1024;
   const MIN_PRESSURE_SIZE = 0.45;
-  const BRUSH_STAMP_ASPECT = 982 / 561;
+  const BRUSH_STAMP_ASPECT = 1000 / 600;
   const PRESSURE_FALLBACK = 0.5;
   const PRESSURE_EPSILON = 0.001;
 
@@ -385,7 +385,7 @@
     // Include the starting point for gapless chaining
     queueStamp(x1, y1, r1, rgba);
 
-    const step = Math.max(1, Math.max(r1, r2) * 0.5);
+    const step = Math.max(1, Math.max(r1, r2) * 0.3);
     const steps = Math.ceil(dist / step);
 
     for (let i = 1; i <= steps; i++) {
