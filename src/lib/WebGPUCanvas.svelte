@@ -11,7 +11,7 @@
     brushSize: number;
   }
 
-  let { color, brushSize }: Props = $props();
+  let { color, brushSize = $bindable() }: Props = $props();
 
   const CANVAS_WIDTH = 4000;
   const CANVAS_HEIGHT = 4000;
@@ -67,6 +67,11 @@
   let isDrawing = false;
   let strokeUsesPressure = false;
   let lastPoint = { x: 0, y: 0, radius: 0 };
+
+  // ---- brush resize state ----
+  let isResizingBrush = false;
+  let resizeStartY = 0;
+  let resizeStartBrushSize = 0;
 
   // ---- pan tracking ----
   let panStart = { clientX: 0, clientY: 0, offsetX: 0, offsetY: 0 };
@@ -703,6 +708,15 @@
       return;
     }
 
+    if (e.button === 0 && e.shiftKey) {
+      brushPreviewVisible = false;
+      isResizingBrush = true;
+      resizeStartY = e.clientY;
+      resizeStartBrushSize = brushSize;
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+
     if (e.button === 0) {
       isDrawing = true;
       strokeUsesPressure = hasRealPressure(e);
@@ -719,6 +733,15 @@
 
   function handlePointerMove(e: PointerEvent) {
     updateBrushPreview(e);
+
+    if (isResizingBrush) {
+      const deltaY = e.clientY - resizeStartY;
+      brushSize = Math.round(
+        clamp(resizeStartBrushSize - deltaY, 1, 500),
+      );
+      updateBrushPreview(e);
+      return;
+    }
 
     if (isPanning) {
       const dx = e.clientX - panStart.clientX;
@@ -752,6 +775,7 @@
   function handlePointerUp(e: PointerEvent) {
     isDrawing = false;
     isPanning = false;
+    isResizingBrush = false;
     strokeUsesPressure = false;
     updateBrushPreview(e);
     try {
@@ -903,6 +927,6 @@
   {/if}
 
   <div class="pointer-events-none absolute bottom-2 right-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white/90 font-mono">
-    {Math.round(zoom * 100)}%
+    {Math.round(zoom * 100)}% · {brushSize}px
   </div>
 </div>
