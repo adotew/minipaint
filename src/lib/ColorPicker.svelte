@@ -166,19 +166,6 @@
     hueEl.releasePointerCapture(e.pointerId);
   }
 
-  function onHexChange(e: Event) {
-    const input = e.currentTarget as HTMLInputElement;
-    const rgb = parseHex(input.value);
-    if (rgb) {
-      const hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
-      h = hsv.h;
-      s = hsv.s;
-      v = hsv.v;
-      emit();
-    } else {
-      input.value = color;
-    }
-  }
 </script>
 
 <div class="flex w-[200px] flex-col gap-3">
@@ -214,17 +201,4 @@
     ></div>
   </div>
 
-  <!-- Preview swatch + hex input -->
-  <div class="flex w-full items-center gap-2">
-    <div
-      class="box-border h-8 w-8 shrink-0 rounded-md border border-zinc-600"
-      style="background-color: {color};"
-    ></div>
-    <input
-      type="text"
-      value={color}
-      onchange={onHexChange}
-      class="box-border min-w-0 flex-1 rounded-md bg-zinc-800 px-3 py-1.5 text-sm font-mono text-zinc-100 outline-none"
-    />
-  </div>
 </div>
