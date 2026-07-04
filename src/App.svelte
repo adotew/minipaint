@@ -42,15 +42,17 @@
   style="transform: translate({translate.x}px, {translate.y}px);"
 >
   <!-- Dotted drag handle -->
-  <div
-    class="flex cursor-grab items-center justify-center active:cursor-grabbing"
-    onpointerdown={onHandlePointerDown}
-  >
+  <div class="relative flex items-center justify-center">
     <div class="flex gap-1">
       {#each Array(5) as _}
         <div class="h-1 w-1 rounded-full bg-zinc-500"></div>
       {/each}
     </div>
+    <!-- Larger invisible hitbox; visual dots stay the same size/position -->
+    <div
+      class="absolute inset-x-0 top-1/2 h-8 -translate-y-1/2 cursor-grab active:cursor-grabbing"
+      onpointerdown={onHandlePointerDown}
+    ></div>
   </div>
 
   <ColorPicker {color} onchange={(c: string) => (color = c)} />

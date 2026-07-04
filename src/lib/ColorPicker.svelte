@@ -102,8 +102,11 @@
     );
   }
 
-  // Sync incoming hex prop to HSV state
+  // Sync incoming hex prop to HSV state only when it changed externally.
+  // If the prop matches what this picker would emit, skip it to avoid
+  // round-trip floating-point drift that makes the hue slider jitter.
   $effect(() => {
+    if (color === hsvToHex(h, s, v)) return;
     const rgb = parseHex(color);
     if (!rgb) return;
     const hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
@@ -172,7 +175,7 @@
   <!-- Saturation / Value area -->
   <div
     bind:this={svEl}
-    class="relative h-36 w-full cursor-crosshair rounded-md"
+    class="relative aspect-square w-full cursor-crosshair rounded-md"
     style="background:
       linear-gradient(to bottom, transparent, #000),
       linear-gradient(to right, #fff, hsl({h}, 100%, 50%));"
