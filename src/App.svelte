@@ -34,8 +34,6 @@
   }
 </script>
 
-<div class="fixed left-0 right-0 top-0 z-40 h-10 [-webkit-app-region:drag]"></div>
-
 <div
   class="fixed top-4 right-4 z-50 flex flex-col gap-3 rounded-xl bg-zinc-900 p-4 shadow-2xl [-webkit-app-region:no-drag]"
   class:cursor-grabbing={isDragging}
