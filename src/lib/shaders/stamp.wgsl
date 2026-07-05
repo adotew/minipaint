@@ -4,8 +4,7 @@
 
 struct Brush {
   center: vec2f,
-  radius: f32,
-  pad1: f32,
+  halfSize: vec2f,
   color: vec4f,
   bounds: vec4f,
 };
@@ -27,8 +26,13 @@ fn stamp(@builtin(global_invocation_id) id: vec3u, @builtin(workgroup_id) wg: ve
 
   if (px < minX || px > maxX || py < minY || py > maxY) { return; }
 
-  let boundsSize = vec2f(brush.bounds.z - brush.bounds.x + 1.0, brush.bounds.w - brush.bounds.y + 1.0);
-  let local = (vec2f(f32(px) + 0.5, f32(py) + 0.5) - brush.bounds.xy) / boundsSize;
+  // Sample from the brush's original, unclamped footprint so stamps at the
+  // canvas edge use the correct part of the brush texture.
+  let origMin = brush.center - brush.halfSize;
+  let origMax = brush.center + brush.halfSize;
+  let origSize = origMax - origMin;
+  var local = (vec2f(f32(px) + 0.5, f32(py) + 0.5) - origMin) / origSize;
+  local = clamp(local, vec2f(0.0), vec2f(1.0));
 
   let stampSize = textureDimensions(brushStamp);
   let stampSizeF = vec2f(f32(stampSize.x), f32(stampSize.y));

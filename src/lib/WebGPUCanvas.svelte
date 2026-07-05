@@ -3,8 +3,8 @@
 
   import stampShaderCode from "./shaders/stamp.wgsl?raw";
   import blitShaderCode from "./shaders/blit.wgsl?raw";
-  import brushStampUrl from "../assets/brush-stamp.png";
-  import brushStampOutlineUrl from "../assets/brush-stamp-outline.png";
+  import brushStampUrl from "../assets/charcoal-removebg-preview.png";
+  import brushStampOutlineUrl from "../assets/charcoal-removebg-preview.png";
 
   interface Props {
     color: string;
@@ -19,7 +19,7 @@
   const MAX_ZOOM = 32;
   const MAX_STAMPS_PER_FRAME = 1024;
   const MIN_PRESSURE_SIZE = 0.45;
-  const BRUSH_STAMP_ASPECT = 1000 / 600;
+  const BRUSH_STAMP_ASPECT = 500 / 500;
   const PRESSURE_FALLBACK = 0.5;
   const PRESSURE_EPSILON = 0.001;
 
@@ -253,16 +253,16 @@
     }
 
     // Fill stamp buffer with all stamp data
-    // Each stamp is 12 f32 values (48 bytes): center.xy, radius, pad1, color, bounds
+    // Each stamp is 12 f32 values (48 bytes): center.xy, halfSize.xy, color, bounds
     for (let i = 0; i < count; i++) {
       const s = stamps[i];
-      const { minX, maxX, minY, maxY } = getStampBounds(s.x, s.y, s.radius);
+      const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(s.x, s.y, s.radius);
 
       const offset = i * 12;
       stampDataView[offset + 0] = s.x;
       stampDataView[offset + 1] = s.y;
-      stampDataView[offset + 2] = s.radius;
-      stampDataView[offset + 3] = 0; // pad1
+      stampDataView[offset + 2] = halfWidth;
+      stampDataView[offset + 3] = halfHeight;
       stampDataView[offset + 4] = s.rgba[0];
       stampDataView[offset + 5] = s.rgba[1];
       stampDataView[offset + 6] = s.rgba[2];
@@ -930,7 +930,7 @@
     </div>
   {/if}
 
-  <div class="pointer-events-none absolute bottom-2 right-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white/90 font-mono">
+  <div class="pointer-events-none absolute bottom-2 right-2 rounded bg-black/60 px-2 py-0.5 text-xs">
     {Math.round(zoom * 100)}% · {brushSize}px
   </div>
 </div>
