@@ -22,6 +22,7 @@
   const BRUSH_STAMP_ASPECT = 500 / 500;
   const PRESSURE_FALLBACK = 0.5;
   const PRESSURE_EPSILON = 0.001;
+  const MAX_HISTORY_DEPTH = 10;
 
   // ---- DOM binding ----
   let canvasEl: HTMLCanvasElement | undefined = $state();
@@ -62,6 +63,11 @@
   let renderPipeline: GPURenderPipeline | null = $state(null);
   let computeBindGroup: GPUBindGroup | null = $state(null);
   let renderBindGroup: GPUBindGroup | null = $state(null);
+
+  // ---- undo / redo state ----
+  let historyTextures: GPUTexture[] = [];
+  let historyIndex = -1;
+  let shouldSaveHistoryAfterFrame = false;
 
   // ---- drawing state ----
   let isDrawing = false;
@@ -175,6 +181,96 @@
     dev.queue.submit([encoder.finish()]);
   }
 
+  function createHistorySnapshot(dev: GPUDevice, source: GPUTexture) {
+    const snapshot = dev.createTexture({
+      size: [CANVAS_WIDTH, CANVAS_HEIGHT],
+      format: "rgba8unorm",
+      usage:
+        GPUTextureUsage.COPY_SRC |
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.TEXTURE_BINDING,
+    });
+
+    const encoder = dev.createCommandEncoder();
+    encoder.copyTextureToTexture(
+      { texture: source },
+      { texture: snapshot },
+      [CANVAS_WIDTH, CANVAS_HEIGHT],
+    );
+    dev.queue.submit([encoder.finish()]);
+
+    return snapshot;
+  }
+
+  function restoreHistorySnapshot(dev: GPUDevice, target: GPUTexture, snapshot: GPUTexture) {
+    const encoder = dev.createCommandEncoder();
+    encoder.copyTextureToTexture(
+      { texture: snapshot },
+      { texture: target },
+      [CANVAS_WIDTH, CANVAS_HEIGHT],
+    );
+    dev.queue.submit([encoder.finish()]);
+  }
+
+  function saveHistoryState() {
+    if (!device || !paintTexture) return;
+
+    // Discard any redo branches before saving a new state.
+    while (historyTextures.length > historyIndex + 1) {
+      historyTextures.pop()?.destroy();
+    }
+
+    const snapshot = createHistorySnapshot(device, paintTexture);
+    historyTextures.push(snapshot);
+    historyIndex++;
+
+    while (historyTextures.length > MAX_HISTORY_DEPTH) {
+      historyTextures.shift()?.destroy();
+      historyIndex--;
+    }
+  }
+
+  export function undo() {
+    if (!device || !paintTexture || historyIndex <= 0) return;
+
+    // Cancel any pending frame and discard an in-progress stroke.
+    shouldSaveHistoryAfterFrame = false;
+    if (rafId !== null) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+    flushFrame();
+
+    historyIndex--;
+    restoreHistorySnapshot(device, paintTexture, historyTextures[historyIndex]);
+
+    isDrawing = false;
+    isPanning = false;
+    isResizingBrush = false;
+    strokeUsesPressure = false;
+    scheduleFrame();
+  }
+
+  export function redo() {
+    if (!device || !paintTexture || historyIndex >= historyTextures.length - 1) return;
+
+    shouldSaveHistoryAfterFrame = false;
+    if (rafId !== null) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+    flushFrame();
+
+    historyIndex++;
+    restoreHistorySnapshot(device, paintTexture, historyTextures[historyIndex]);
+
+    isDrawing = false;
+    isPanning = false;
+    isResizingBrush = false;
+    strokeUsesPressure = false;
+    scheduleFrame();
+  }
+
   /**
    * Process all queued stamps in a single compute dispatch (storage buffer)
    * plus one render pass → one GPU submit.
@@ -231,6 +327,11 @@
       renderPass.end();
 
       device.queue.submit([encoder.finish()]);
+
+      if (shouldSaveHistoryAfterFrame) {
+        saveHistoryState();
+        shouldSaveHistoryAfterFrame = false;
+      }
 
       if (pendingStamps.length > 0) {
         scheduleFrame();
@@ -315,6 +416,10 @@
     if (pendingStamps.length > 0) {
       scheduleFrame();
     } else {
+      if (shouldSaveHistoryAfterFrame) {
+        saveHistoryState();
+        shouldSaveHistoryAfterFrame = false;
+      }
       rafId = null;
     }
   }
@@ -438,7 +543,9 @@
         usage:
           GPUTextureUsage.TEXTURE_BINDING |
           GPUTextureUsage.STORAGE_BINDING |
-          GPUTextureUsage.RENDER_ATTACHMENT,
+          GPUTextureUsage.RENDER_ATTACHMENT |
+          GPUTextureUsage.COPY_SRC |
+          GPUTextureUsage.COPY_DST,
       });
 
       const brushBitmap = await loadBrushStampBitmap();
@@ -576,6 +683,7 @@
       renderBindGroup = rndrBindGroup;
 
       clearPaintToWhite(dev, paintTex);
+      saveHistoryState();
 
       // Initial present
       if (canvasWidth > 0 && canvasHeight > 0) {
@@ -594,6 +702,11 @@
       brushStampTexture?.destroy();
       stampBuffer?.destroy();
       viewUniformBuffer?.destroy();
+      for (const tex of historyTextures) {
+        tex.destroy();
+      }
+      historyTextures = [];
+      historyIndex = -1;
     };
   });
 
@@ -777,11 +890,19 @@
   }
 
   function handlePointerUp(e: PointerEvent) {
+    const wasDrawing = isDrawing;
+
     isDrawing = false;
     isPanning = false;
     isResizingBrush = false;
     strokeUsesPressure = false;
     updateBrushPreview(e);
+
+    if (wasDrawing) {
+      shouldSaveHistoryAfterFrame = true;
+      scheduleFrame();
+    }
+
     try {
       canvasEl?.releasePointerCapture(e.pointerId);
     } catch {
@@ -880,6 +1001,22 @@
       if ((e.ctrlKey || e.metaKey) && e.key === "1") {
         e.preventDefault();
         zoomTo100();
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+        return;
+      }
+
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))
+      ) {
+        e.preventDefault();
+        redo();
+        return;
       }
     }
 
@@ -930,7 +1067,7 @@
     </div>
   {/if}
 
-  <div class="pointer-events-none absolute bottom-2 right-2 rounded bg-black/60 px-2 py-0.5 text-xs">
+  <div class="pointer-events-none absolute bottom-2 right-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white">
     {Math.round(zoom * 100)}% · {brushSize}px
   </div>
 </div>

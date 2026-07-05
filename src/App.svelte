@@ -5,6 +5,8 @@
   let color = $state("#aabbcc");
   let brushSize = $state(10);
 
+  let canvasRef: { undo(): void; redo(): void } | undefined = $state();
+
   // Panel drag state
   let translate = $state({ x: 0, y: 0 });
   let dragStart = { x: 0, y: 0 };
@@ -55,7 +57,22 @@
     ></div>
   </div>
 
+  <div class="flex justify-center gap-2">
+    <button
+      class="rounded bg-zinc-700 px-3 py-1 text-xs text-white hover:bg-zinc-600 active:bg-zinc-500"
+      onclick={() => canvasRef?.undo()}
+    >
+      Undo
+    </button>
+    <button
+      class="rounded bg-zinc-700 px-3 py-1 text-xs text-white hover:bg-zinc-600 active:bg-zinc-500"
+      onclick={() => canvasRef?.redo()}
+    >
+      Redo
+    </button>
+  </div>
+
   <ColorPicker {color} onchange={(c: string) => (color = c)} />
 </div>
 
-<WebGPUCanvas {color} bind:brushSize />
+<WebGPUCanvas bind:this={canvasRef} {color} bind:brushSize />
