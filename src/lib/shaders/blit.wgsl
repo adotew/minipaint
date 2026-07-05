@@ -20,7 +20,7 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let paintCoord = pos.xy * view.scale + view.offset;
   let uv = paintCoord / view.paintDims;
   if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-    return vec4f(0.5, 0.5, 0.5, 1.0);
+    return vec4f(0.0, 0.0, 0.0, 0.0);
   }
 
   return textureSampleLevel(paintTex, paintSampler, uv, 0.0);

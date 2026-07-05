@@ -1045,7 +1045,7 @@
 
   <canvas
     bind:this={canvasEl}
-    class="block h-screen w-screen bg-neutral-500"
+    class="canvas-bg block h-screen w-screen"
     style="image-rendering: {imageRenderHint}; cursor: {cursor}"
     onwheel={handleWheel}
     onpointerdown={handlePointerDown}
@@ -1062,7 +1062,7 @@
     >
       <div
         class="absolute inset-0"
-        style="background: rgba(255, 255, 255, 0.01); -webkit-backdrop-filter: invert(1); backdrop-filter: invert(1); -webkit-mask: url('{brushStampOutlineUrl}') center / contain no-repeat; mask: url('{brushStampOutlineUrl}') center / contain no-repeat;"
+        style="background: rgba(255, 255, 255, 0.01); -webkit-backdrop-filter: invert(1); backdrop-filter: invert(1); -webkit-mask: url('{brushStampOutlineUrl}') center / contain no-repeat; mask: url('{brushStampOutlineUrl}') center / contain no-repeat; filter: drop-shadow(0 0 1px rgba(255, 255, 255, 0.9)) drop-shadow(0 0 2px rgba(0, 0, 0, 0.7));"
       ></div>
     </div>
   {/if}
