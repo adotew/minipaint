@@ -18,7 +18,12 @@
   const MIN_ZOOM = 0.01;
   const MAX_ZOOM = 32;
   const MAX_STAMPS_PER_FRAME = 1024;
+  const FLOATS_PER_STAMP = 12;
   const MIN_PRESSURE_SIZE = 0.45;
+  const MIN_PRESSURE_OPACITY = 0.08;
+  const PRESSURE_OPACITY_GAMMA = 1.35;
+  const STAMP_SPACING_RATIO = 0.25;
+  const MIN_STAMP_SPACING = 1;
   const BRUSH_STAMP_ASPECT = 500 / 500;
   const PRESSURE_FALLBACK = 0.5;
   const PRESSURE_EPSILON = 0.001;
@@ -60,10 +65,11 @@
   let paintTexture: GPUTexture | null = $state(null);
   let brushStampTexture: GPUTexture | null = $state(null);
   let stampBuffer: GPUBuffer | null = $state(null);
+  let stampUniformBuffer: GPUBuffer | null = $state(null);
   let viewUniformBuffer: GPUBuffer | null = $state(null);
-  let computePipeline: GPUComputePipeline | null = $state(null);
+  let stampPipeline: GPURenderPipeline | null = $state(null);
   let renderPipeline: GPURenderPipeline | null = $state(null);
-  let computeBindGroup: GPUBindGroup | null = $state(null);
+  let stampBindGroup: GPUBindGroup | null = $state(null);
   let renderBindGroup: GPUBindGroup | null = $state(null);
 
   // ---- undo / redo state ----
@@ -74,7 +80,8 @@
   // ---- drawing state ----
   let isDrawing = false;
   let strokeUsesPressure = false;
-  let lastPoint = { x: 0, y: 0, radius: 0 };
+  let lastPoint = { x: 0, y: 0, radius: 0, opacity: 1 };
+  let distanceSinceLastStamp = 0;
 
   // ---- brush resize state ----
   let isResizingBrush = false;
@@ -95,8 +102,6 @@
     rgba: [number, number, number, number];
   };
   let pendingStamps: PendingStamp[] = [];
-  let maxStampW = 0;
-  let maxStampH = 0;
   let rafId: number | null = null;
 
   // ---- current canvas internal size (set by ResizeObserver) ----
@@ -117,6 +122,14 @@
     const g = parseInt(clean.substring(2, 4), 16) / 255;
     const b = parseInt(clean.substring(4, 6), 16) / 255;
     return [r, g, b, 1];
+  }
+
+  function withAlpha(rgba: [number, number, number, number], alpha: number): [number, number, number, number] {
+    return [rgba[0], rgba[1], rgba[2], alpha];
+  }
+
+  function lerp(a: number, b: number, t: number) {
+    return a + (b - a) * t;
   }
 
   function clamp(n: number, min: number, max: number) {
@@ -219,6 +232,10 @@
     }
 
     return { halfWidth: radius * BRUSH_STAMP_ASPECT, halfHeight: radius };
+  }
+
+  function getStampSpacing(radius: number) {
+    return Math.max(MIN_STAMP_SPACING, radius * STAMP_SPACING_RATIO);
   }
 
   function getStampBounds(x: number, y: number, radius: number) {
@@ -333,6 +350,7 @@
     isPanning = false;
     isResizingBrush = false;
     strokeUsesPressure = false;
+    distanceSinceLastStamp = 0;
     scheduleFrame();
   }
 
@@ -353,6 +371,7 @@
     isPanning = false;
     isResizingBrush = false;
     strokeUsesPressure = false;
+    distanceSinceLastStamp = 0;
     scheduleFrame();
   }
 
@@ -393,18 +412,20 @@
   }
 
   /**
-   * Process all queued stamps in a single compute dispatch (storage buffer)
-   * plus one render pass → one GPU submit.
+   * Process queued stamps with alpha blending, then blit the paint texture to
+   * the visible canvas. Stamps are rendered as instanced textured quads so
+   * pressure opacity can build up naturally through fixed-function blending.
    */
   function flushFrame() {
     if (
       !device ||
       !context ||
+      !paintTexture ||
       !stampBuffer ||
       !viewUniformBuffer ||
-      !computePipeline ||
+      !stampPipeline ||
       !renderPipeline ||
-      !computeBindGroup ||
+      !stampBindGroup ||
       !renderBindGroup
     ) {
       rafId = null;
@@ -419,10 +440,6 @@
     const stamps = pendingStamps;
     const n = stamps.length;
     pendingStamps = [];
-    const stampW = maxStampW;
-    const stampH = maxStampH;
-    maxStampW = 0;
-    maxStampH = 0;
 
     if (n === 0) {
       // No stamps — still need to render for pan/zoom updates
@@ -465,22 +482,17 @@
     // Clamp to MAX_STAMPS_PER_FRAME and keep overflow for the next frame.
     const count = Math.min(n, MAX_STAMPS_PER_FRAME);
     if (n > count) {
-      const overflow = stamps.slice(count);
-      pendingStamps = overflow.concat(pendingStamps);
-      for (const s of overflow) {
-        const bounds = getStampBounds(s.x, s.y, s.radius);
-        maxStampW = Math.max(maxStampW, bounds.width);
-        maxStampH = Math.max(maxStampH, bounds.height);
-      }
+      pendingStamps = stamps.slice(count).concat(pendingStamps);
     }
 
-    // Fill stamp buffer with all stamp data
-    // Each stamp is 12 f32 values (48 bytes): center.xy, halfSize.xy, color, bounds
+    // Fill stamp buffer with all stamp data.
+    // Each stamp is 12 f32 values (48 bytes): center.xy, halfSize.xy, color, bounds.
+    // Bounds are kept for the existing layout but are not used by render stamping.
     for (let i = 0; i < count; i++) {
       const s = stamps[i];
       const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(s.x, s.y, s.radius);
 
-      const offset = i * 12;
+      const offset = i * FLOATS_PER_STAMP;
       stampDataView[offset + 0] = s.x;
       stampDataView[offset + 1] = s.y;
       stampDataView[offset + 2] = halfWidth;
@@ -495,26 +507,30 @@
       stampDataView[offset + 11] = maxY;
     }
 
-    // Single write of all stamp data
-    device.queue.writeBuffer(stampBuffer, 0, stampDataView, 0, count * 12);
+    // Single write of all stamp data.
+    device.queue.writeBuffer(stampBuffer, 0, stampDataView, 0, count * FLOATS_PER_STAMP);
 
-    // Update view uniforms
+    // Update view uniforms.
     writeViewUniforms(device);
 
     const encoder = device.createCommandEncoder();
 
-    // Single compute pass, one 3D dispatch
-    const computePass = encoder.beginComputePass();
-    computePass.setPipeline(computePipeline);
-    computePass.setBindGroup(0, computeBindGroup);
-    computePass.dispatchWorkgroups(
-      Math.max(1, Math.ceil(stampW / 8)),
-      Math.max(1, Math.ceil(stampH / 8)),
-      count,
-    );
-    computePass.end();
+    // Stamp into the full-resolution paint texture with alpha blending.
+    const stampPass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: paintTexture.createView(),
+          loadOp: "load",
+          storeOp: "store",
+        },
+      ],
+    });
+    stampPass.setPipeline(stampPipeline);
+    stampPass.setBindGroup(0, stampBindGroup);
+    stampPass.draw(6, count);
+    stampPass.end();
 
-    // Single render pass
+    // Blit the updated paint texture to the visible canvas.
     const textureView = context.getCurrentTexture().createView();
     const renderPass = encoder.beginRenderPass({
       colorAttachments: [
@@ -572,7 +588,7 @@
     radius: number,
     rgba: [number, number, number, number],
   ) {
-    const { minX, maxX, minY, maxY, width, height, halfWidth, halfHeight } = getStampBounds(x, y, radius);
+    const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(x, y, radius);
 
     if (
       x + halfWidth < 0 ||
@@ -586,8 +602,6 @@
     }
 
     pendingStamps.push({ x, y, radius, rgba });
-    if (width > maxStampW) maxStampW = width;
-    if (height > maxStampH) maxStampH = height;
     scheduleFrame();
   }
 
@@ -595,29 +609,42 @@
     x1: number,
     y1: number,
     r1: number,
+    o1: number,
     x2: number,
     y2: number,
     r2: number,
+    o2: number,
     rgba: [number, number, number, number],
   ) {
     const dx = x2 - x1;
     const dy = y2 - y1;
     const dist = Math.hypot(dx, dy);
-    if (dist === 0) {
-      queueStamp(x1, y1, r2, rgba);
-      return;
-    }
+    if (dist === 0) return;
 
-    // Include the starting point for gapless chaining
-    queueStamp(x1, y1, r1, rgba);
+    let travelled = 0;
+    while (travelled < dist) {
+      const spacingT = travelled / dist;
+      const spacingRadius = lerp(r1, r2, spacingT);
+      const spacing = getStampSpacing(spacingRadius);
+      const distanceToNextStamp = Math.max(0, spacing - distanceSinceLastStamp);
+      const remainingDistance = dist - travelled;
 
-    const step = Math.max(1, Math.max(r1, r2) * 0.3);
-    const steps = Math.ceil(dist / step);
+      if (distanceToNextStamp > remainingDistance) {
+        distanceSinceLastStamp += remainingDistance;
+        return;
+      }
 
-    for (let i = 1; i <= steps; i++) {
-      const t = i / steps;
-      const radius = r1 + (r2 - r1) * t;
-      queueStamp(x1 + dx * t, y1 + dy * t, radius, rgba);
+      travelled += distanceToNextStamp;
+      const t = travelled / dist;
+      const radius = lerp(r1, r2, t);
+      const opacity = lerp(o1, o2, t);
+      queueStamp(
+        x1 + dx * t,
+        y1 + dy * t,
+        radius,
+        withAlpha(rgba, opacity),
+      );
+      distanceSinceLastStamp = 0;
     }
   }
 
@@ -692,20 +719,31 @@
       );
       brushBitmap.close?.();
 
-      const sampler = dev.createSampler({
+      const paintSampler = dev.createSampler({
         magFilter: "nearest",
         minFilter: "nearest",
       });
+      const brushSampler = dev.createSampler({
+        magFilter: "linear",
+        minFilter: "linear",
+      });
 
       // Storage buffer for stamp data (12 f32 × MAX_STAMPS_PER_FRAME)
-      const brushBufSize = 12 * MAX_STAMPS_PER_FRAME * 4; // f32 = 4 bytes
+      const brushBufSize = FLOATS_PER_STAMP * MAX_STAMPS_PER_FRAME * 4; // f32 = 4 bytes
       const brushBuf = dev.createBuffer({
         size: brushBufSize,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       });
 
       // Pre-allocate CPU-side view for filling stamp data
-      stampDataView = new Float32Array(12 * MAX_STAMPS_PER_FRAME);
+      stampDataView = new Float32Array(FLOATS_PER_STAMP * MAX_STAMPS_PER_FRAME);
+
+      // Stamp uniforms (16 bytes; vec2f + padding)
+      const stampUbo = dev.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      dev.queue.writeBuffer(stampUbo, 0, new Float32Array([CANVAS_WIDTH, CANVAS_HEIGHT, 0, 0]));
 
       // View uniforms (32 bytes)
       const viewUbo = dev.createBuffer({
@@ -713,47 +751,56 @@
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
 
-      // ---- Compute pipeline (stamp) ----
-      const computeBindGroupLayout = dev.createBindGroupLayout({
+      // ---- Render pipeline (stamp into paint texture) ----
+      const stampBindGroupLayout = dev.createBindGroupLayout({
         entries: [
-          {
-            binding: 0,
-            visibility: GPUShaderStage.COMPUTE,
-            storageTexture: {
-              access: "write-only",
-              format: "rgba8unorm",
-              viewDimension: "2d",
-            },
-          },
-          {
-            binding: 1,
-            visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "read-only-storage" },
-          },
-          {
-            binding: 2,
-            visibility: GPUShaderStage.COMPUTE,
-            texture: { sampleType: "float", viewDimension: "2d" },
-          },
+          { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+          { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+          { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+          { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
         ],
       });
 
-      const compPipeline = dev.createComputePipeline({
+      const stampShaderModule = dev.createShaderModule({ code: stampShaderCode });
+      const stmpPipeline = dev.createRenderPipeline({
         layout: dev.createPipelineLayout({
-          bindGroupLayouts: [computeBindGroupLayout],
+          bindGroupLayouts: [stampBindGroupLayout],
         }),
-        compute: {
-          module: dev.createShaderModule({ code: stampShaderCode }),
-          entryPoint: "stamp",
+        vertex: {
+          module: stampShaderModule,
+          entryPoint: "vs",
         },
+        fragment: {
+          module: stampShaderModule,
+          entryPoint: "fs",
+          targets: [
+            {
+              format: "rgba8unorm",
+              blend: {
+                color: {
+                  operation: "add",
+                  srcFactor: "src-alpha",
+                  dstFactor: "one-minus-src-alpha",
+                },
+                alpha: {
+                  operation: "add",
+                  srcFactor: "one",
+                  dstFactor: "one-minus-src-alpha",
+                },
+              },
+            },
+          ],
+        },
+        primitive: { topology: "triangle-list" },
       });
 
-      const compBindGroup = dev.createBindGroup({
-        layout: computeBindGroupLayout,
+      const stmpBindGroup = dev.createBindGroup({
+        layout: stampBindGroupLayout,
         entries: [
-          { binding: 0, resource: paintTex.createView() },
-          { binding: 1, resource: { buffer: brushBuf } },
-          { binding: 2, resource: brushTex.createView() },
+          { binding: 0, resource: brushSampler },
+          { binding: 1, resource: brushTex.createView() },
+          { binding: 2, resource: { buffer: brushBuf } },
+          { binding: 3, resource: { buffer: stampUbo } },
         ],
       });
 
@@ -785,7 +832,7 @@
       const rndrBindGroup = dev.createBindGroup({
         layout: renderBindGroupLayout,
         entries: [
-          { binding: 0, resource: sampler },
+          { binding: 0, resource: paintSampler },
           { binding: 1, resource: paintTex.createView() },
           { binding: 2, resource: { buffer: viewUbo } },
         ],
@@ -797,10 +844,11 @@
       paintTexture = paintTex;
       brushStampTexture = brushTex;
       stampBuffer = brushBuf;
+      stampUniformBuffer = stampUbo;
       viewUniformBuffer = viewUbo;
-      computePipeline = compPipeline;
+      stampPipeline = stmpPipeline;
       renderPipeline = rndrPipeline;
-      computeBindGroup = compBindGroup;
+      stampBindGroup = stmpBindGroup;
       renderBindGroup = rndrBindGroup;
 
       clearPaintToWhite(dev, paintTex);
@@ -822,6 +870,7 @@
       paintTexture?.destroy();
       brushStampTexture?.destroy();
       stampBuffer?.destroy();
+      stampUniformBuffer?.destroy();
       viewUniformBuffer?.destroy();
       for (const tex of historyTextures) {
         tex.destroy();
@@ -963,8 +1012,11 @@
       const screenY = e.clientY - rect.top;
       const { x, y } = screenToCanvas(screenX, screenY);
       const radius = getRadius(e, brushSize * MIN_PRESSURE_SIZE / 2);
-      lastPoint = { x, y, radius };
-      queueStamp(x, y, radius, hexToVec4(color));
+      const opacity = getOpacity(e, MIN_PRESSURE_OPACITY);
+      const rgba = hexToVec4(color);
+      lastPoint = { x, y, radius, opacity };
+      distanceSinceLastStamp = 0;
+      queueStamp(x, y, radius, withAlpha(rgba, opacity));
       canvas.setPointerCapture(e.pointerId);
     }
   }
@@ -1006,8 +1058,19 @@
     const { x, y } = screenToCanvas(screenX, screenY);
 
     const radius = getRadius(e, lastPoint.radius || brushSize * MIN_PRESSURE_SIZE / 2);
-    stampLine(lastPoint.x, lastPoint.y, lastPoint.radius, x, y, radius, hexToVec4(color));
-    lastPoint = { x, y, radius };
+    const opacity = getOpacity(e, lastPoint.opacity);
+    stampLine(
+      lastPoint.x,
+      lastPoint.y,
+      lastPoint.radius,
+      lastPoint.opacity,
+      x,
+      y,
+      radius,
+      opacity,
+      hexToVec4(color),
+    );
+    lastPoint = { x, y, radius, opacity };
   }
 
   function handlePointerUp(e: PointerEvent) {
@@ -1017,6 +1080,7 @@
     isPanning = false;
     isResizingBrush = false;
     strokeUsesPressure = false;
+    distanceSinceLastStamp = 0;
     updateBrushPreview(e);
 
     if (wasDrawing) {
@@ -1034,6 +1098,7 @@
   function handlePointerLeave() {
     isDrawing = false;
     strokeUsesPressure = false;
+    distanceSinceLastStamp = 0;
     brushPreviewVisible = false;
   }
 
@@ -1076,11 +1141,24 @@
 
     const p = typeof e.pressure === "number" ? e.pressure : 0;
     if (p > 0) {
-      const pressureScale = MIN_PRESSURE_SIZE + (1 - MIN_PRESSURE_SIZE) * Math.min(1, p);
+      const pressureScale = MIN_PRESSURE_SIZE + (1 - MIN_PRESSURE_SIZE) * clamp(p, 0, 1);
       return brushSize * pressureScale / 2;
     }
 
     return fallbackRadius;
+  }
+
+  function getOpacity(e: PointerEvent, fallbackOpacity: number): number {
+    if (!strokeUsesPressure) return 1;
+
+    const p = typeof e.pressure === "number" ? e.pressure : 0;
+    if (p > 0) {
+      const pressure = clamp(p, 0, 1);
+      return MIN_PRESSURE_OPACITY +
+        (1 - MIN_PRESSURE_OPACITY) * Math.pow(pressure, PRESSURE_OPACITY_GAMMA);
+    }
+
+    return fallbackOpacity;
   }
 
   // ====================================================================

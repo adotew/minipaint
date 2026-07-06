@@ -1,6 +1,12 @@
-@group(0) @binding(0) var paint: texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(1) var<storage> brushes: array<Brush>;
-@group(0) @binding(2) var brushStamp: texture_2d<f32>;
+@group(0) @binding(0) var brushSampler: sampler;
+@group(0) @binding(1) var brushStamp: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> brushes: array<Brush>;
+@group(0) @binding(3) var<uniform> paint: Paint;
+
+struct Paint {
+  dims: vec2f,
+  padding: vec2f,
+};
 
 struct Brush {
   center: vec2f,
@@ -9,38 +15,49 @@ struct Brush {
   bounds: vec4f,
 };
 
-@compute @workgroup_size(8, 8, 1)
-fn stamp(@builtin(global_invocation_id) id: vec3u, @builtin(workgroup_id) wg: vec3u) {
-  let stampIndex = wg.z;
-  if (stampIndex >= arrayLength(&brushes)) { return; }
+struct VertexOut {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f,
+  @location(1) color: vec4f,
+};
 
-  let brush = brushes[stampIndex];
+fn quadCorner(vertexIndex: u32) -> vec2f {
+  let corners = array<vec2f, 6>(
+    vec2f(-1.0, -1.0),
+    vec2f(1.0, -1.0),
+    vec2f(-1.0, 1.0),
+    vec2f(-1.0, 1.0),
+    vec2f(1.0, -1.0),
+    vec2f(1.0, 1.0),
+  );
 
-  let minX = u32(brush.bounds.x);
-  let minY = u32(brush.bounds.y);
-  let maxX = u32(brush.bounds.z);
-  let maxY = u32(brush.bounds.w);
+  return corners[vertexIndex];
+}
 
-  let px = id.x + minX;
-  let py = id.y + minY;
+@vertex
+fn vs(
+  @builtin(vertex_index) vertexIndex: u32,
+  @builtin(instance_index) instanceIndex: u32,
+) -> VertexOut {
+  let brush = brushes[instanceIndex];
+  let corner = quadCorner(vertexIndex);
+  let paintPos = brush.center + corner * brush.halfSize;
 
-  if (px < minX || px > maxX || py < minY || py > maxY) { return; }
+  var out: VertexOut;
+  out.position = vec4f(
+    paintPos.x / paint.dims.x * 2.0 - 1.0,
+    1.0 - paintPos.y / paint.dims.y * 2.0,
+    0.0,
+    1.0,
+  );
+  out.uv = corner * 0.5 + vec2f(0.5, 0.5);
+  out.color = brush.color;
+  return out;
+}
 
-  // Sample from the brush's original, unclamped footprint so stamps at the
-  // canvas edge use the correct part of the brush texture.
-  let origMin = brush.center - brush.halfSize;
-  let origMax = brush.center + brush.halfSize;
-  let origSize = origMax - origMin;
-  var local = (vec2f(f32(px) + 0.5, f32(py) + 0.5) - origMin) / origSize;
-  local = clamp(local, vec2f(0.0), vec2f(1.0));
-
-  let stampSize = textureDimensions(brushStamp);
-  let stampSizeF = vec2f(f32(stampSize.x), f32(stampSize.y));
-  let stampMax = stampSize - vec2u(1, 1);
-  let stampPos = min(vec2u(local * stampSizeF), stampMax);
-  let mask = textureLoad(brushStamp, vec2i(i32(stampPos.x), i32(stampPos.y)), 0).a;
-
-  if (mask > 0.05) {
-    textureStore(paint, vec2i(i32(px), i32(py)), brush.color);
-  }
+@fragment
+fn fs(in: VertexOut) -> @location(0) vec4f {
+  let mask = textureSample(brushStamp, brushSampler, in.uv).a;
+  let alpha = clamp(in.color.a * mask, 0.0, 1.0);
+  return vec4f(in.color.rgb, alpha);
 }
