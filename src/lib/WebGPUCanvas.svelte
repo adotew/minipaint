@@ -23,6 +23,8 @@
   const PRESSURE_FALLBACK = 0.5;
   const PRESSURE_EPSILON = 0.001;
   const MAX_HISTORY_DEPTH = 10;
+  const BYTES_PER_PIXEL = 4;
+  const COPY_BYTES_PER_ROW_ALIGNMENT = 256;
 
   // ---- DOM binding ----
   let canvasEl: HTMLCanvasElement | undefined = $state();
@@ -119,6 +121,89 @@
 
   function clamp(n: number, min: number, max: number) {
     return Math.max(min, Math.min(max, n));
+  }
+
+  function alignTo(n: number, alignment: number) {
+    return Math.ceil(n / alignment) * alignment;
+  }
+
+  function makeExportFilename() {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return `minipaint-${timestamp}.png`;
+  }
+
+  function downloadBlob(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function canvasToPngBlob(canvas: HTMLCanvasElement) {
+    return new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (blob) {
+          resolve(blob);
+        } else {
+          reject(new Error("Failed to encode PNG."));
+        }
+      }, "image/png");
+    });
+  }
+
+  async function readTextureAsPngBlob(dev: GPUDevice, texture: GPUTexture) {
+    const bytesPerRow = CANVAS_WIDTH * BYTES_PER_PIXEL;
+    const paddedBytesPerRow = alignTo(bytesPerRow, COPY_BYTES_PER_ROW_ALIGNMENT);
+    const bufferSize = paddedBytesPerRow * CANVAS_HEIGHT;
+    const readBuffer = dev.createBuffer({
+      size: bufferSize,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const encoder = dev.createCommandEncoder();
+    encoder.copyTextureToBuffer(
+      { texture },
+      {
+        buffer: readBuffer,
+        bytesPerRow: paddedBytesPerRow,
+        rowsPerImage: CANVAS_HEIGHT,
+      },
+      [CANVAS_WIDTH, CANVAS_HEIGHT, 1],
+    );
+    dev.queue.submit([encoder.finish()]);
+
+    let isMapped = false;
+    try {
+      await readBuffer.mapAsync(GPUMapMode.READ);
+      isMapped = true;
+
+      const mapped = readBuffer.getMappedRange();
+      const source = new Uint8Array(mapped);
+      const pixels = new Uint8ClampedArray(CANVAS_WIDTH * CANVAS_HEIGHT * BYTES_PER_PIXEL);
+
+      for (let y = 0; y < CANVAS_HEIGHT; y++) {
+        const sourceOffset = y * paddedBytesPerRow;
+        const targetOffset = y * bytesPerRow;
+        pixels.set(source.subarray(sourceOffset, sourceOffset + bytesPerRow), targetOffset);
+      }
+
+      const exportCanvas = document.createElement("canvas");
+      exportCanvas.width = CANVAS_WIDTH;
+      exportCanvas.height = CANVAS_HEIGHT;
+
+      const ctx = exportCanvas.getContext("2d");
+      if (!ctx) throw new Error("Could not create PNG export canvas.");
+
+      ctx.putImageData(new ImageData(pixels, CANVAS_WIDTH, CANVAS_HEIGHT), 0, 0);
+      return await canvasToPngBlob(exportCanvas);
+    } finally {
+      if (isMapped) readBuffer.unmap();
+      readBuffer.destroy();
+    }
   }
 
   function screenToCanvas(screenX: number, screenY: number) {
@@ -269,6 +354,42 @@
     isResizingBrush = false;
     strokeUsesPressure = false;
     scheduleFrame();
+  }
+
+  function cancelScheduledFrame() {
+    if (rafId === null) return;
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+
+  function flushPendingWorkForExport() {
+    cancelScheduledFrame();
+
+    const maxFlushes = Math.ceil(pendingStamps.length / MAX_STAMPS_PER_FRAME) + 1;
+    let flushes = 0;
+    while (pendingStamps.length > 0) {
+      if (flushes > maxFlushes) {
+        throw new Error("Could not flush pending paint data before export.");
+      }
+      flushFrame();
+      cancelScheduledFrame();
+      flushes++;
+    }
+
+    if (shouldSaveHistoryAfterFrame) {
+      flushFrame();
+      cancelScheduledFrame();
+    }
+  }
+
+  export async function exportAsPng() {
+    if (!device || !paintTexture) {
+      throw new Error("Canvas is not ready to export yet.");
+    }
+
+    flushPendingWorkForExport();
+    const blob = await readTextureAsPngBlob(device, paintTexture);
+    downloadBlob(blob, makeExportFilename());
   }
 
   /**

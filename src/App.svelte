@@ -5,6 +5,14 @@
   let color = $state("#aabbcc");
   let brushSize = $state(10);
 
+  type CanvasHandle = {
+    exportAsPng: () => Promise<void>;
+  };
+
+  let webgpuCanvas: CanvasHandle | undefined = $state();
+  let isExporting = $state(false);
+  let exportError = $state<string | null>(null);
+
   // Panel drag state
   let translate = $state({ x: 0, y: 0 });
   let dragStart = { x: 0, y: 0 };
@@ -32,7 +40,41 @@
     isDragging = false;
     window.removeEventListener("pointermove", onHandlePointerMove);
   }
+
+  async function exportPng() {
+    if (isExporting) return;
+
+    isExporting = true;
+    exportError = null;
+
+    try {
+      if (!webgpuCanvas) throw new Error("Canvas is not ready to export yet.");
+      await webgpuCanvas.exportAsPng();
+    } catch (e) {
+      console.error(e);
+      exportError = e instanceof Error ? e.message : "Failed to export PNG.";
+    } finally {
+      isExporting = false;
+    }
+  }
+
+  $effect(() => {
+    const unsubscribe = window.minipaint?.onExportPng(() => {
+      void exportPng();
+    });
+
+    return () => unsubscribe?.();
+  });
 </script>
+
+{#if exportError}
+  <div
+    role="alert"
+    class="fixed left-4 top-16 z-50 max-w-sm rounded-lg bg-red-950/95 px-3 py-2 text-sm text-red-100 shadow-2xl [-webkit-app-region:no-drag]"
+  >
+    {exportError}
+  </div>
+{/if}
 
 <div
   class="fixed top-4 right-4 z-50 flex flex-col gap-3 rounded-xl bg-zinc-900 p-4 shadow-2xl [-webkit-app-region:no-drag]"
@@ -59,4 +101,4 @@
   <ColorPicker {color} onchange={(c: string) => (color = c)} />
 </div>
 
-<WebGPUCanvas {color} bind:brushSize />
+<WebGPUCanvas bind:this={webgpuCanvas} {color} bind:brushSize />

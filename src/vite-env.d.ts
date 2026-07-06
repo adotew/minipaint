@@ -5,3 +5,9 @@ declare module "*?raw" {
   const content: string;
   export default content;
 }
+
+interface Window {
+  minipaint?: {
+    onExportPng: (callback: () => void) => () => void;
+  };
+}
