@@ -48,6 +48,9 @@
     </div>
     <!-- Larger invisible hitbox; visual dots stay the same size/position -->
     <div
+      role="button"
+      tabindex="-1"
+      aria-label="Drag to move panel"
       class="absolute inset-x-0 top-1/2 h-8 -translate-y-1/2 cursor-grab active:cursor-grabbing"
       onpointerdown={onHandlePointerDown}
     ></div>

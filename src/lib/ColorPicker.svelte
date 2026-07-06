@@ -174,6 +174,9 @@
 <div class="flex w-[200px] flex-col gap-3">
   <!-- Saturation / Value area -->
   <div
+    role="button"
+    tabindex="-1"
+    aria-label="Color saturation and brightness picker"
     bind:this={svEl}
     class="relative aspect-square w-full cursor-crosshair rounded-md"
     style="background:
@@ -191,6 +194,12 @@
 
   <!-- Hue slider -->
   <div
+    role="slider"
+    tabindex="-1"
+    aria-label="Hue"
+    aria-valuenow={Math.round(h)}
+    aria-valuemin="0"
+    aria-valuemax="360"
     bind:this={hueEl}
     class="relative h-4 w-full cursor-pointer rounded-md"
     style="background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);"
