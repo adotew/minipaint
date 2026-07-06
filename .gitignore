@@ -16,6 +16,9 @@ dist-ssr/
 build/
 .vite/
 
+# Local planning docs
+/docs/
+
 # Tauri / Rust build output
 src-tauri/target/
 src-tauri/gen/
