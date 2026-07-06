@@ -16,10 +16,16 @@ contextBridge.exposeInMainWorld("minipaint", {
   onOpenProject(callback) {
     return onMenuCommand("menu:open-project", callback);
   },
-  saveProjectFile(bytes) {
-    return ipcRenderer.invoke("project:save", bytes);
+  onShowGallery(callback) {
+    return onMenuCommand("menu:show-gallery", callback);
+  },
+  saveProjectFile(bytes, path) {
+    return ipcRenderer.invoke("project:save", bytes, path);
   },
   openProjectFile() {
     return ipcRenderer.invoke("project:open");
+  },
+  openRecentProjectFile(path) {
+    return ipcRenderer.invoke("project:open-recent", path);
   },
 });

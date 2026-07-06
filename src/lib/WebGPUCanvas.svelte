@@ -109,8 +109,10 @@
     | LayerDeleteHistoryEntry
     | LayerReorderHistoryEntry;
 
-  const CANVAS_WIDTH = 4000;
-  const CANVAS_HEIGHT = 4000;
+  const DEFAULT_CANVAS_WIDTH = 4000;
+  const DEFAULT_CANVAS_HEIGHT = 4000;
+  const MIN_CANVAS_SIZE = 64;
+  const MAX_CANVAS_SIZE = 8000;
   const MIN_ZOOM = 0.01;
   const MAX_ZOOM = 32;
   const MAX_STAMPS_PER_FRAME = 1024;
@@ -171,8 +173,12 @@
   let renderBindGroup: GPUBindGroup | null = $state(null);
   let compositeBindGroupLayout: GPUBindGroupLayout | null = null;
   let compositeSampler: GPUSampler | null = null;
+  let renderBindGroupLayout: GPUBindGroupLayout | null = null;
+  let paintSampler: GPUSampler | null = null;
 
   // ---- layer state ----
+  let documentWidth = $state(DEFAULT_CANVAS_WIDTH);
+  let documentHeight = $state(DEFAULT_CANVAS_HEIGHT);
   let layers: PaintLayer[] = [];
   let layerList = $state<LayerListItem[]>([]);
   let activeLayerId = $state<LayerId | null>(null);
@@ -278,9 +284,9 @@
   }
 
   async function readTexturePixels(dev: GPUDevice, texture: GPUTexture) {
-    const bytesPerRow = CANVAS_WIDTH * BYTES_PER_PIXEL;
+    const bytesPerRow = documentWidth * BYTES_PER_PIXEL;
     const paddedBytesPerRow = alignTo(bytesPerRow, COPY_BYTES_PER_ROW_ALIGNMENT);
-    const bufferSize = paddedBytesPerRow * CANVAS_HEIGHT;
+    const bufferSize = paddedBytesPerRow * documentHeight;
     const readBuffer = dev.createBuffer({
       size: bufferSize,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
@@ -292,9 +298,9 @@
       {
         buffer: readBuffer,
         bytesPerRow: paddedBytesPerRow,
-        rowsPerImage: CANVAS_HEIGHT,
+        rowsPerImage: documentHeight,
       },
-      [CANVAS_WIDTH, CANVAS_HEIGHT, 1],
+      [documentWidth, documentHeight, 1],
     );
     dev.queue.submit([encoder.finish()]);
 
@@ -305,9 +311,9 @@
 
       const mapped = readBuffer.getMappedRange();
       const source = new Uint8Array(mapped);
-      const pixels = new Uint8ClampedArray(CANVAS_WIDTH * CANVAS_HEIGHT * BYTES_PER_PIXEL);
+      const pixels = new Uint8ClampedArray(documentWidth * documentHeight * BYTES_PER_PIXEL);
 
-      for (let y = 0; y < CANVAS_HEIGHT; y++) {
+      for (let y = 0; y < documentHeight; y++) {
         const sourceOffset = y * paddedBytesPerRow;
         const targetOffset = y * bytesPerRow;
         pixels.set(source.subarray(sourceOffset, sourceOffset + bytesPerRow), targetOffset);
@@ -322,13 +328,13 @@
 
   async function pixelsToPngBlob(pixels: Uint8ClampedArray) {
     const exportCanvas = document.createElement("canvas");
-    exportCanvas.width = CANVAS_WIDTH;
-    exportCanvas.height = CANVAS_HEIGHT;
+    exportCanvas.width = documentWidth;
+    exportCanvas.height = documentHeight;
 
     const ctx = exportCanvas.getContext("2d");
     if (!ctx) throw new Error("Could not create PNG export canvas.");
 
-    ctx.putImageData(new ImageData(pixels, CANVAS_WIDTH, CANVAS_HEIGHT), 0, 0);
+    ctx.putImageData(new ImageData(pixels, documentWidth, documentHeight), 0, 0);
     return await canvasToPngBlob(exportCanvas);
   }
 
@@ -361,33 +367,33 @@
     }
   }
 
-  async function pngBlobToPixels(blob: Blob) {
+  async function pngBlobToPixels(blob: Blob, width = documentWidth, height = documentHeight) {
     const bitmap = await createImageBitmap(blob);
     try {
-      if (bitmap.width !== CANVAS_WIDTH || bitmap.height !== CANVAS_HEIGHT) {
+      if (bitmap.width !== width || bitmap.height !== height) {
         throw new Error(`Layer image has unsupported size ${bitmap.width} × ${bitmap.height}.`);
       }
 
       const decodeCanvas = document.createElement("canvas");
-      decodeCanvas.width = CANVAS_WIDTH;
-      decodeCanvas.height = CANVAS_HEIGHT;
+      decodeCanvas.width = width;
+      decodeCanvas.height = height;
       const ctx = decodeCanvas.getContext("2d");
       if (!ctx) throw new Error("Could not create PNG decode canvas.");
 
-      ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.clearRect(0, 0, width, height);
       ctx.drawImage(bitmap, 0, 0);
-      return ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT).data;
+      return ctx.getImageData(0, 0, width, height).data;
     } finally {
       bitmap.close?.();
     }
   }
 
   function uploadTexturePixels(dev: GPUDevice, texture: GPUTexture, pixels: Uint8ClampedArray) {
-    const bytesPerRow = CANVAS_WIDTH * BYTES_PER_PIXEL;
+    const bytesPerRow = documentWidth * BYTES_PER_PIXEL;
     const paddedBytesPerRow = alignTo(bytesPerRow, COPY_BYTES_PER_ROW_ALIGNMENT);
-    const padded = new Uint8Array(paddedBytesPerRow * CANVAS_HEIGHT);
+    const padded = new Uint8Array(paddedBytesPerRow * documentHeight);
 
-    for (let y = 0; y < CANVAS_HEIGHT; y++) {
+    for (let y = 0; y < documentHeight; y++) {
       const sourceOffset = y * bytesPerRow;
       const targetOffset = y * paddedBytesPerRow;
       padded.set(pixels.subarray(sourceOffset, sourceOffset + bytesPerRow), targetOffset);
@@ -398,9 +404,9 @@
       padded,
       {
         bytesPerRow: paddedBytesPerRow,
-        rowsPerImage: CANVAS_HEIGHT,
+        rowsPerImage: documentHeight,
       },
-      [CANVAS_WIDTH, CANVAS_HEIGHT, 1],
+      [documentWidth, documentHeight, 1],
     );
   }
 
@@ -436,9 +442,9 @@
   function getStampBounds(x: number, y: number, radius: number) {
     const { halfWidth, halfHeight } = getStampHalfSize(radius);
     const minX = Math.max(0, Math.floor(x - halfWidth));
-    const maxX = Math.min(CANVAS_WIDTH - 1, Math.ceil(x + halfWidth));
+    const maxX = Math.min(documentWidth - 1, Math.ceil(x + halfWidth));
     const minY = Math.max(0, Math.floor(y - halfHeight));
-    const maxY = Math.min(CANVAS_HEIGHT - 1, Math.ceil(y + halfHeight));
+    const maxY = Math.min(documentHeight - 1, Math.ceil(y + halfHeight));
 
     return {
       minX,
@@ -465,7 +471,7 @@
   function createDocumentTexture(dev: GPUDevice, label: string) {
     return dev.createTexture({
       label,
-      size: [CANVAS_WIDTH, CANVAS_HEIGHT],
+      size: [documentWidth, documentHeight],
       format: "rgba8unorm",
       usage:
         GPUTextureUsage.TEXTURE_BINDING |
@@ -491,13 +497,37 @@
     dev.queue.submit([encoder.finish()]);
   }
 
+  function recreateCompositeResources(dev: GPUDevice) {
+    if (!renderBindGroupLayout || !paintSampler || !viewUniformBuffer) {
+      throw new Error("Viewport rendering is not ready.");
+    }
+
+    const oldCompositeTexture = compositeTexture;
+    const texture = createDocumentTexture(dev, "Composite texture");
+    const view = texture.createView();
+    const bindGroup = dev.createBindGroup({
+      layout: renderBindGroupLayout,
+      entries: [
+        { binding: 0, resource: paintSampler },
+        { binding: 1, resource: view },
+        { binding: 2, resource: { buffer: viewUniformBuffer } },
+      ],
+    });
+
+    compositeTexture = texture;
+    compositeTextureView = view;
+    renderBindGroup = bindGroup;
+    oldCompositeTexture?.destroy();
+    markCompositeDirty();
+  }
+
   function copyTexture(dev: GPUDevice, source: GPUTexture, label: string) {
     const snapshot = createDocumentTexture(dev, label);
     const encoder = dev.createCommandEncoder();
     encoder.copyTextureToTexture(
       { texture: source },
       { texture: snapshot },
-      [CANVAS_WIDTH, CANVAS_HEIGHT],
+      [documentWidth, documentHeight],
     );
     dev.queue.submit([encoder.finish()]);
     return snapshot;
@@ -508,7 +538,7 @@
     encoder.copyTextureToTexture(
       { texture: snapshot },
       { texture: target },
-      [CANVAS_WIDTH, CANVAS_HEIGHT],
+      [documentWidth, documentHeight],
     );
     dev.queue.submit([encoder.finish()]);
   }
@@ -650,7 +680,12 @@
     const canvas = asRecord(root.canvas, "canvas");
     const width = asNumber(canvas.width, "canvas.width");
     const height = asNumber(canvas.height, "canvas.height");
-    if (width !== CANVAS_WIDTH || height !== CANVAS_HEIGHT) {
+    if (
+      width < MIN_CANVAS_SIZE ||
+      height < MIN_CANVAS_SIZE ||
+      width > MAX_CANVAS_SIZE ||
+      height > MAX_CANVAS_SIZE
+    ) {
       throw new Error(`Unsupported canvas size ${width} × ${height}.`);
     }
 
@@ -1008,6 +1043,29 @@
     downloadBlob(blob, makeExportFilename());
   }
 
+  export function newProject(width = DEFAULT_CANVAS_WIDTH, height = DEFAULT_CANVAS_HEIGHT) {
+    if (!device) throw new Error("Canvas is not ready to create a new project yet.");
+
+    const nextWidth = Math.round(clamp(width, MIN_CANVAS_SIZE, MAX_CANVAS_SIZE));
+    const nextHeight = Math.round(clamp(height, MIN_CANVAS_SIZE, MAX_CANVAS_SIZE));
+
+    cancelScheduledFrame();
+    resetInteractionState();
+    pendingStamps = [];
+    clearHistory();
+
+    documentWidth = nextWidth;
+    documentHeight = nextHeight;
+    device.queue.writeBuffer(stampUniformBuffer!, 0, new Float32Array([documentWidth, documentHeight, 0, 0]));
+    recreateCompositeResources(device);
+
+    const initialLayer = createPaintLayer(device, { name: "Layer 1" });
+    replaceLayers([initialLayer], initialLayer.id);
+    nextLayerNumber = 2;
+    fitToScreen();
+    scheduleFrame();
+  }
+
   export async function saveProject() {
     if (!device) throw new Error("Canvas is not ready to save yet.");
 
@@ -1036,8 +1094,8 @@
       format: "minipaint-project",
       version: 1,
       canvas: {
-        width: CANVAS_WIDTH,
-        height: CANVAS_HEIGHT,
+        width: documentWidth,
+        height: documentHeight,
         background: "#ffffff",
         colorSpace: "srgb",
       },
@@ -1074,17 +1132,34 @@
     if (!manifestBytes) throw new Error("Invalid project file: manifest.json is missing.");
 
     const manifest = parseProjectManifest(JSON.parse(new TextDecoder().decode(manifestBytes)));
+    const decodedLayers: { metadata: ProjectLayerManifest; pixels: Uint8ClampedArray }[] = [];
+
+    for (const layerManifest of manifest.layers) {
+      const imageBytes = entries.get(layerManifest.image);
+      if (!imageBytes) throw new Error(`Invalid project file: ${layerManifest.image} is missing.`);
+
+      const pixels = await pngBlobToPixels(
+        bytesToBlob(imageBytes, "image/png"),
+        manifest.canvas.width,
+        manifest.canvas.height,
+      );
+      premultiplyPixels(pixels);
+      decodedLayers.push({ metadata: layerManifest, pixels });
+    }
+
     const loadedLayers: PaintLayer[] = [];
+    resetInteractionState();
+    pendingStamps = [];
+    clearHistory();
+    documentWidth = manifest.canvas.width;
+    documentHeight = manifest.canvas.height;
+    device.queue.writeBuffer(stampUniformBuffer!, 0, new Float32Array([documentWidth, documentHeight, 0, 0]));
+    recreateCompositeResources(device);
 
     try {
-      for (const layerManifest of manifest.layers) {
-        const imageBytes = entries.get(layerManifest.image);
-        if (!imageBytes) throw new Error(`Invalid project file: ${layerManifest.image} is missing.`);
-
-        const pixels = await pngBlobToPixels(bytesToBlob(imageBytes, "image/png"));
-        premultiplyPixels(pixels);
-        const layer = createPaintLayer(device, layerManifest);
-        uploadTexturePixels(device, layer.texture, pixels);
+      for (const decodedLayer of decodedLayers) {
+        const layer = createPaintLayer(device, decodedLayer.metadata);
+        uploadTexturePixels(device, layer.texture, decodedLayer.pixels);
         loadedLayers.push(layer);
       }
     } catch (e) {
@@ -1094,9 +1169,6 @@
       throw e;
     }
 
-    resetInteractionState();
-    pendingStamps = [];
-    clearHistory();
     replaceLayers(loadedLayers, manifest.activeLayerId);
     updateNextLayerNumber();
     zoom = clamp(manifest.view.zoom, MIN_ZOOM, MAX_ZOOM);
@@ -1106,6 +1178,7 @@
     brushSize = clamp(Math.round(manifest.brush.size), 1, 500);
     hasFitInitialView = true;
     scheduleFrame();
+    return { width: documentWidth, height: documentHeight };
   }
 
   function rebuildComposite(encoder: GPUCommandEncoder) {
@@ -1260,8 +1333,8 @@
       cssHeight / (canvasHeight * zoom),
       offsetX,
       offsetY,
-      CANVAS_WIDTH,
-      CANVAS_HEIGHT,
+      documentWidth,
+      documentHeight,
       0, 0, // padding to 32 bytes (16-byte alignment)
     ]);
     dev.queue.writeBuffer(viewUniformBuffer!, 0, viewUniforms);
@@ -1283,8 +1356,8 @@
     if (
       x + halfWidth < 0 ||
       y + halfHeight < 0 ||
-      x - halfWidth >= CANVAS_WIDTH ||
-      y - halfHeight >= CANVAS_HEIGHT ||
+      x - halfWidth >= documentWidth ||
+      y - halfHeight >= documentHeight ||
       maxX < minX ||
       maxY < minY
     ) {
@@ -1403,7 +1476,7 @@
       );
       brushBitmap.close?.();
 
-      const paintSampler = dev.createSampler({
+      const paintSamp = dev.createSampler({
         magFilter: "nearest",
         minFilter: "nearest",
       });
@@ -1431,7 +1504,7 @@
         size: 16,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
-      dev.queue.writeBuffer(stampUbo, 0, new Float32Array([CANVAS_WIDTH, CANVAS_HEIGHT, 0, 0]));
+      dev.queue.writeBuffer(stampUbo, 0, new Float32Array([documentWidth, documentHeight, 0, 0]));
 
       // View uniforms (32 bytes)
       const viewUbo = dev.createBuffer({
@@ -1536,7 +1609,7 @@
       compositeSampler = layerSampler;
 
       // ---- Render pipeline (blit) ----
-      const renderBindGroupLayout = dev.createBindGroupLayout({
+      const renderBgLayout = dev.createBindGroupLayout({
         entries: [
           { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
           { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
@@ -1546,7 +1619,7 @@
 
       const rndrPipeline = dev.createRenderPipeline({
         layout: dev.createPipelineLayout({
-          bindGroupLayouts: [renderBindGroupLayout],
+          bindGroupLayouts: [renderBgLayout],
         }),
         vertex: {
           module: dev.createShaderModule({ code: blitShaderCode }),
@@ -1561,9 +1634,9 @@
       });
 
       const rndrBindGroup = dev.createBindGroup({
-        layout: renderBindGroupLayout,
+        layout: renderBgLayout,
         entries: [
-          { binding: 0, resource: paintSampler },
+          { binding: 0, resource: paintSamp },
           { binding: 1, resource: compositeView },
           { binding: 2, resource: { buffer: viewUbo } },
         ],
@@ -1590,6 +1663,8 @@
       renderPipeline = rndrPipeline;
       stampBindGroup = stmpBindGroup;
       renderBindGroup = rndrBindGroup;
+      renderBindGroupLayout = renderBgLayout;
+      paintSampler = paintSamp;
 
       // Initial present
       if (canvasWidth > 0 && canvasHeight > 0) {
@@ -1630,6 +1705,8 @@
       renderPipeline = null;
       stampBindGroup = null;
       renderBindGroup = null;
+      renderBindGroupLayout = null;
+      paintSampler = null;
       layers = [];
       layerList = [];
       activeLayerId = null;
@@ -1699,12 +1776,12 @@
     if (!canvas) return;
     const vw = canvas.clientWidth;
     const vh = canvas.clientHeight;
-    const scale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min(vw / CANVAS_WIDTH, vh / CANVAS_HEIGHT)));
+    const scale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min(vw / documentWidth, vh / documentHeight)));
     const visibleWidth = vw / scale;
     const visibleHeight = vh / scale;
     zoom = scale;
-    offsetX = (CANVAS_WIDTH - visibleWidth) / 2;
-    offsetY = (CANVAS_HEIGHT - visibleHeight) / 2;
+    offsetX = (documentWidth - visibleWidth) / 2;
+    offsetY = (documentHeight - visibleHeight) / 2;
     scheduleFrame();
   }
 
@@ -1959,16 +2036,16 @@
 
       if ((e.ctrlKey || e.metaKey) && (e.key === "+" || e.key === "=")) {
         e.preventDefault();
-        const cw = canvasEl?.clientWidth ?? CANVAS_WIDTH;
-        const ch = canvasEl?.clientHeight ?? CANVAS_HEIGHT;
+        const cw = canvasEl?.clientWidth ?? documentWidth;
+        const ch = canvasEl?.clientHeight ?? documentHeight;
         applyZoom(1.25, cw / 2, ch / 2);
         return;
       }
 
       if ((e.ctrlKey || e.metaKey) && e.key === "-") {
         e.preventDefault();
-        const cw = canvasEl?.clientWidth ?? CANVAS_WIDTH;
-        const ch = canvasEl?.clientHeight ?? CANVAS_HEIGHT;
+        const cw = canvasEl?.clientWidth ?? documentWidth;
+        const ch = canvasEl?.clientHeight ?? documentHeight;
         applyZoom(0.8, cw / 2, ch / 2);
         return;
       }

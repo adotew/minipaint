@@ -11,7 +11,9 @@ interface Window {
     onExportPng: (callback: () => void) => () => void;
     onSaveProject: (callback: () => void) => () => void;
     onOpenProject: (callback: () => void) => () => void;
-    saveProjectFile: (bytes: ArrayBuffer) => Promise<boolean>;
-    openProjectFile: () => Promise<ArrayBuffer | null>;
+    onShowGallery: (callback: () => void) => () => void;
+    saveProjectFile: (bytes: ArrayBuffer, path?: string | null) => Promise<string | null>;
+    openProjectFile: () => Promise<{ path: string; bytes: ArrayBuffer } | null>;
+    openRecentProjectFile: (path: string) => Promise<{ path: string; bytes: ArrayBuffer } | null>;
   };
 }
