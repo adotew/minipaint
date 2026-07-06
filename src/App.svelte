@@ -7,11 +7,15 @@
 
   type CanvasHandle = {
     exportAsPng: () => Promise<void>;
+    saveProject: () => Promise<Blob>;
+    loadProject: (blob: Blob) => Promise<void>;
   };
 
   let webgpuCanvas: CanvasHandle | undefined = $state();
   let isExporting = $state(false);
-  let exportError = $state<string | null>(null);
+  let isSaving = $state(false);
+  let isOpening = $state(false);
+  let actionError = $state<string | null>(null);
 
   // Panel drag state
   let translate = $state({ x: 0, y: 0 });
@@ -41,38 +45,103 @@
     window.removeEventListener("pointermove", onHandlePointerMove);
   }
 
+  function makeProjectFilename() {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    return `minipaint-${timestamp}.minipaint`;
+  }
+
+  function downloadBlob(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   async function exportPng() {
     if (isExporting) return;
 
     isExporting = true;
-    exportError = null;
+    actionError = null;
 
     try {
       if (!webgpuCanvas) throw new Error("Canvas is not ready to export yet.");
       await webgpuCanvas.exportAsPng();
     } catch (e) {
       console.error(e);
-      exportError = e instanceof Error ? e.message : "Failed to export PNG.";
+      actionError = e instanceof Error ? e.message : "Failed to export PNG.";
     } finally {
       isExporting = false;
     }
   }
 
+  async function saveProject() {
+    if (isSaving) return;
+
+    isSaving = true;
+    actionError = null;
+
+    try {
+      if (!webgpuCanvas) throw new Error("Canvas is not ready to save yet.");
+      const blob = await webgpuCanvas.saveProject();
+      const bytes = await blob.arrayBuffer();
+      const didSave = await window.minipaint?.saveProjectFile?.(bytes);
+      if (didSave === undefined) downloadBlob(blob, makeProjectFilename());
+    } catch (e) {
+      console.error(e);
+      actionError = e instanceof Error ? e.message : "Failed to save project.";
+    } finally {
+      isSaving = false;
+    }
+  }
+
+  async function openProject() {
+    if (isOpening) return;
+
+    isOpening = true;
+    actionError = null;
+
+    try {
+      if (!webgpuCanvas) throw new Error("Canvas is not ready to open a project yet.");
+      const bytes = await window.minipaint?.openProjectFile?.();
+      if (!bytes) return;
+      await webgpuCanvas.loadProject(new Blob([bytes], { type: "application/x-minipaint" }));
+    } catch (e) {
+      console.error(e);
+      actionError = e instanceof Error ? e.message : "Failed to open project.";
+    } finally {
+      isOpening = false;
+    }
+  }
+
   $effect(() => {
-    const unsubscribe = window.minipaint?.onExportPng(() => {
+    const unsubscribeExport = window.minipaint?.onExportPng(() => {
       void exportPng();
     });
+    const unsubscribeSave = window.minipaint?.onSaveProject?.(() => {
+      void saveProject();
+    });
+    const unsubscribeOpen = window.minipaint?.onOpenProject?.(() => {
+      void openProject();
+    });
 
-    return () => unsubscribe?.();
+    return () => {
+      unsubscribeExport?.();
+      unsubscribeSave?.();
+      unsubscribeOpen?.();
+    };
   });
 </script>
 
-{#if exportError}
+{#if actionError}
   <div
     role="alert"
     class="fixed left-4 top-16 z-50 max-w-sm rounded-lg bg-red-950/95 px-3 py-2 text-sm text-red-100 shadow-2xl [-webkit-app-region:no-drag]"
   >
-    {exportError}
+    {actionError}
   </div>
 {/if}
 
@@ -101,4 +170,4 @@
   <ColorPicker {color} onchange={(c: string) => (color = c)} />
 </div>
 
-<WebGPUCanvas bind:this={webgpuCanvas} {color} bind:brushSize />
+<WebGPUCanvas bind:this={webgpuCanvas} bind:color bind:brushSize />

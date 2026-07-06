@@ -1,9 +1,25 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
+function onMenuCommand(channel, callback) {
+  const listener = () => callback();
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
 contextBridge.exposeInMainWorld("minipaint", {
   onExportPng(callback) {
-    const listener = () => callback();
-    ipcRenderer.on("menu:export-png", listener);
-    return () => ipcRenderer.removeListener("menu:export-png", listener);
+    return onMenuCommand("menu:export-png", callback);
+  },
+  onSaveProject(callback) {
+    return onMenuCommand("menu:save-project", callback);
+  },
+  onOpenProject(callback) {
+    return onMenuCommand("menu:open-project", callback);
+  },
+  saveProjectFile(bytes) {
+    return ipcRenderer.invoke("project:save", bytes);
+  },
+  openProjectFile() {
+    return ipcRenderer.invoke("project:open");
   },
 });

@@ -2,6 +2,7 @@
   /// <reference types="@webgpu/types" />
 
   import LayerPanel, { type LayerListItem } from "./LayerPanel.svelte";
+  import { createZipBlob, readZipEntries, type ZipEntry } from "./projectZip";
   import stampShaderCode from "./shaders/stamp.wgsl?raw";
   import blitShaderCode from "./shaders/blit.wgsl?raw";
   import compositeShaderCode from "./shaders/composite.wgsl?raw";
@@ -13,7 +14,7 @@
     brushSize: number;
   }
 
-  let { color, brushSize = $bindable() }: Props = $props();
+  let { color = $bindable(), brushSize = $bindable() }: Props = $props();
 
   type LayerId = string;
 
@@ -32,6 +33,32 @@
     name: string;
     visible: boolean;
     locked: boolean;
+  };
+
+  type ProjectLayerManifest = LayerMetadata & {
+    image: string;
+  };
+
+  type ProjectManifest = {
+    format: "minipaint-project";
+    version: 1;
+    canvas: {
+      width: number;
+      height: number;
+      background: "#ffffff";
+      colorSpace: "srgb";
+    };
+    activeLayerId: LayerId | null;
+    view: {
+      zoom: number;
+      offsetX: number;
+      offsetY: number;
+    };
+    brush: {
+      color: string;
+      size: number;
+    };
+    layers: ProjectLayerManifest[];
   };
 
   type PaintHistoryEntry = {
@@ -250,7 +277,7 @@
     });
   }
 
-  async function readTextureAsPngBlob(dev: GPUDevice, texture: GPUTexture) {
+  async function readTexturePixels(dev: GPUDevice, texture: GPUTexture) {
     const bytesPerRow = CANVAS_WIDTH * BYTES_PER_PIXEL;
     const paddedBytesPerRow = alignTo(bytesPerRow, COPY_BYTES_PER_ROW_ALIGNMENT);
     const bufferSize = paddedBytesPerRow * CANVAS_HEIGHT;
@@ -286,19 +313,105 @@
         pixels.set(source.subarray(sourceOffset, sourceOffset + bytesPerRow), targetOffset);
       }
 
-      const exportCanvas = document.createElement("canvas");
-      exportCanvas.width = CANVAS_WIDTH;
-      exportCanvas.height = CANVAS_HEIGHT;
-
-      const ctx = exportCanvas.getContext("2d");
-      if (!ctx) throw new Error("Could not create PNG export canvas.");
-
-      ctx.putImageData(new ImageData(pixels, CANVAS_WIDTH, CANVAS_HEIGHT), 0, 0);
-      return await canvasToPngBlob(exportCanvas);
+      return pixels;
     } finally {
       if (isMapped) readBuffer.unmap();
       readBuffer.destroy();
     }
+  }
+
+  async function pixelsToPngBlob(pixels: Uint8ClampedArray) {
+    const exportCanvas = document.createElement("canvas");
+    exportCanvas.width = CANVAS_WIDTH;
+    exportCanvas.height = CANVAS_HEIGHT;
+
+    const ctx = exportCanvas.getContext("2d");
+    if (!ctx) throw new Error("Could not create PNG export canvas.");
+
+    ctx.putImageData(new ImageData(pixels, CANVAS_WIDTH, CANVAS_HEIGHT), 0, 0);
+    return await canvasToPngBlob(exportCanvas);
+  }
+
+  async function readTextureAsPngBlob(dev: GPUDevice, texture: GPUTexture) {
+    return await pixelsToPngBlob(await readTexturePixels(dev, texture));
+  }
+
+  function unpremultiplyPixels(pixels: Uint8ClampedArray) {
+    for (let i = 0; i < pixels.length; i += BYTES_PER_PIXEL) {
+      const alpha = pixels[i + 3];
+      if (alpha === 0) {
+        pixels[i] = 0;
+        pixels[i + 1] = 0;
+        pixels[i + 2] = 0;
+        continue;
+      }
+
+      pixels[i] = Math.min(255, Math.round(pixels[i] * 255 / alpha));
+      pixels[i + 1] = Math.min(255, Math.round(pixels[i + 1] * 255 / alpha));
+      pixels[i + 2] = Math.min(255, Math.round(pixels[i + 2] * 255 / alpha));
+    }
+  }
+
+  function premultiplyPixels(pixels: Uint8ClampedArray) {
+    for (let i = 0; i < pixels.length; i += BYTES_PER_PIXEL) {
+      const alpha = pixels[i + 3];
+      pixels[i] = Math.round(pixels[i] * alpha / 255);
+      pixels[i + 1] = Math.round(pixels[i + 1] * alpha / 255);
+      pixels[i + 2] = Math.round(pixels[i + 2] * alpha / 255);
+    }
+  }
+
+  async function pngBlobToPixels(blob: Blob) {
+    const bitmap = await createImageBitmap(blob);
+    try {
+      if (bitmap.width !== CANVAS_WIDTH || bitmap.height !== CANVAS_HEIGHT) {
+        throw new Error(`Layer image has unsupported size ${bitmap.width} × ${bitmap.height}.`);
+      }
+
+      const decodeCanvas = document.createElement("canvas");
+      decodeCanvas.width = CANVAS_WIDTH;
+      decodeCanvas.height = CANVAS_HEIGHT;
+      const ctx = decodeCanvas.getContext("2d");
+      if (!ctx) throw new Error("Could not create PNG decode canvas.");
+
+      ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+      ctx.drawImage(bitmap, 0, 0);
+      return ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT).data;
+    } finally {
+      bitmap.close?.();
+    }
+  }
+
+  function uploadTexturePixels(dev: GPUDevice, texture: GPUTexture, pixels: Uint8ClampedArray) {
+    const bytesPerRow = CANVAS_WIDTH * BYTES_PER_PIXEL;
+    const paddedBytesPerRow = alignTo(bytesPerRow, COPY_BYTES_PER_ROW_ALIGNMENT);
+    const padded = new Uint8Array(paddedBytesPerRow * CANVAS_HEIGHT);
+
+    for (let y = 0; y < CANVAS_HEIGHT; y++) {
+      const sourceOffset = y * bytesPerRow;
+      const targetOffset = y * paddedBytesPerRow;
+      padded.set(pixels.subarray(sourceOffset, sourceOffset + bytesPerRow), targetOffset);
+    }
+
+    dev.queue.writeTexture(
+      { texture },
+      padded,
+      {
+        bytesPerRow: paddedBytesPerRow,
+        rowsPerImage: CANVAS_HEIGHT,
+      },
+      [CANVAS_WIDTH, CANVAS_HEIGHT, 1],
+    );
+  }
+
+  function bytesToBlob(bytes: Uint8Array, type: string) {
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    return new Blob([copy], { type });
+  }
+
+  function blobToBytes(blob: Blob) {
+    return blob.arrayBuffer().then((buffer) => new Uint8Array(buffer));
   }
 
   function screenToCanvas(screenX: number, screenY: number) {
@@ -478,6 +591,121 @@
 
   function markCompositeDirty() {
     compositeDirty = true;
+  }
+
+  function clearHistory() {
+    for (const entry of historyEntries) {
+      destroyHistoryEntry(entry);
+    }
+    historyEntries = [];
+    historyIndex = -1;
+    currentStrokeHistory?.before.destroy();
+    currentStrokeHistory = null;
+    shouldSaveHistoryAfterFrame = false;
+    strokeHadPaint = false;
+  }
+
+  function replaceLayers(nextLayers: PaintLayer[], nextActiveLayerId: LayerId | null) {
+    for (const layer of layers) {
+      destroyLayer(layer);
+    }
+
+    layers = nextLayers;
+    activeLayerId = nextActiveLayerId && layers.some((layer) => layer.id === nextActiveLayerId)
+      ? nextActiveLayerId
+      : layers[layers.length - 1]?.id ?? null;
+    syncLayerList();
+    markCompositeDirty();
+  }
+
+  function asRecord(value: unknown, label: string): Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`Invalid project file: ${label} must be an object.`);
+    }
+    return value as Record<string, unknown>;
+  }
+
+  function asString(value: unknown, label: string) {
+    if (typeof value !== "string") throw new Error(`Invalid project file: ${label} must be a string.`);
+    return value;
+  }
+
+  function asNumber(value: unknown, label: string) {
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new Error(`Invalid project file: ${label} must be a number.`);
+    }
+    return value;
+  }
+
+  function asBoolean(value: unknown, label: string) {
+    if (typeof value !== "boolean") throw new Error(`Invalid project file: ${label} must be a boolean.`);
+    return value;
+  }
+
+  function parseProjectManifest(value: unknown): ProjectManifest {
+    const root = asRecord(value, "manifest");
+    if (root.format !== "minipaint-project") throw new Error("Unsupported project file format.");
+    if (root.version !== 1) throw new Error("Unsupported project file version.");
+
+    const canvas = asRecord(root.canvas, "canvas");
+    const width = asNumber(canvas.width, "canvas.width");
+    const height = asNumber(canvas.height, "canvas.height");
+    if (width !== CANVAS_WIDTH || height !== CANVAS_HEIGHT) {
+      throw new Error(`Unsupported canvas size ${width} × ${height}.`);
+    }
+
+    const view = asRecord(root.view, "view");
+    const brush = asRecord(root.brush, "brush");
+    const rawLayers = root.layers;
+    if (!Array.isArray(rawLayers) || rawLayers.length === 0) {
+      throw new Error("Invalid project file: at least one layer is required.");
+    }
+
+    const layersManifest = rawLayers.map((rawLayer, index): ProjectLayerManifest => {
+      const layer = asRecord(rawLayer, `layers[${index}]`);
+      return {
+        id: asString(layer.id, `layers[${index}].id`),
+        name: asString(layer.name, `layers[${index}].name`),
+        image: asString(layer.image, `layers[${index}].image`),
+        visible: asBoolean(layer.visible, `layers[${index}].visible`),
+        locked: asBoolean(layer.locked, `layers[${index}].locked`),
+      };
+    });
+
+    const activeLayerId = root.activeLayerId === null
+      ? null
+      : asString(root.activeLayerId, "activeLayerId");
+
+    return {
+      format: "minipaint-project",
+      version: 1,
+      canvas: {
+        width,
+        height,
+        background: "#ffffff",
+        colorSpace: "srgb",
+      },
+      activeLayerId,
+      view: {
+        zoom: asNumber(view.zoom, "view.zoom"),
+        offsetX: asNumber(view.offsetX, "view.offsetX"),
+        offsetY: asNumber(view.offsetY, "view.offsetY"),
+      },
+      brush: {
+        color: asString(brush.color, "brush.color"),
+        size: asNumber(brush.size, "brush.size"),
+      },
+      layers: layersManifest,
+    };
+  }
+
+  function updateNextLayerNumber() {
+    let maxLayerNumber = 0;
+    for (const layer of layers) {
+      const match = /^Layer (\d+)$/.exec(layer.name);
+      if (match) maxLayerNumber = Math.max(maxLayerNumber, Number(match[1]));
+    }
+    nextLayerNumber = Math.max(maxLayerNumber + 1, layers.length + 1);
   }
 
   function destroyHistoryEntry(entry: HistoryEntry) {
@@ -778,6 +1006,106 @@
     flushPendingWorkForExport();
     const blob = await readTextureAsPngBlob(device, compositeTexture);
     downloadBlob(blob, makeExportFilename());
+  }
+
+  export async function saveProject() {
+    if (!device) throw new Error("Canvas is not ready to save yet.");
+
+    flushPendingWorkForExport();
+
+    const entries: ZipEntry[] = [];
+    const projectLayers: ProjectLayerManifest[] = [];
+
+    for (let i = 0; i < layers.length; i++) {
+      const layer = layers[i];
+      const image = `layers/${String(i).padStart(3, "0")}-${layer.id.replace(/[^a-zA-Z0-9_-]/g, "_")}.png`;
+      const pixels = await readTexturePixels(device, layer.texture);
+      unpremultiplyPixels(pixels);
+      const png = await pixelsToPngBlob(pixels);
+      entries.push({ path: image, data: await blobToBytes(png) });
+      projectLayers.push({
+        id: layer.id,
+        name: layer.name,
+        image,
+        visible: layer.visible,
+        locked: layer.locked,
+      });
+    }
+
+    const manifest: ProjectManifest = {
+      format: "minipaint-project",
+      version: 1,
+      canvas: {
+        width: CANVAS_WIDTH,
+        height: CANVAS_HEIGHT,
+        background: "#ffffff",
+        colorSpace: "srgb",
+      },
+      activeLayerId,
+      view: {
+        zoom,
+        offsetX,
+        offsetY,
+      },
+      brush: {
+        color,
+        size: brushSize,
+      },
+      layers: projectLayers,
+    };
+
+    entries.unshift({
+      path: "manifest.json",
+      data: new TextEncoder().encode(JSON.stringify(manifest, null, 2)),
+    });
+
+    return createZipBlob(entries);
+  }
+
+  export async function loadProject(blob: Blob) {
+    if (!device) throw new Error("Canvas is not ready to open a project yet.");
+
+    cancelScheduledFrame();
+    resetInteractionState();
+    pendingStamps = [];
+
+    const entries = await readZipEntries(blob);
+    const manifestBytes = entries.get("manifest.json");
+    if (!manifestBytes) throw new Error("Invalid project file: manifest.json is missing.");
+
+    const manifest = parseProjectManifest(JSON.parse(new TextDecoder().decode(manifestBytes)));
+    const loadedLayers: PaintLayer[] = [];
+
+    try {
+      for (const layerManifest of manifest.layers) {
+        const imageBytes = entries.get(layerManifest.image);
+        if (!imageBytes) throw new Error(`Invalid project file: ${layerManifest.image} is missing.`);
+
+        const pixels = await pngBlobToPixels(bytesToBlob(imageBytes, "image/png"));
+        premultiplyPixels(pixels);
+        const layer = createPaintLayer(device, layerManifest);
+        uploadTexturePixels(device, layer.texture, pixels);
+        loadedLayers.push(layer);
+      }
+    } catch (e) {
+      for (const layer of loadedLayers) {
+        destroyLayer(layer);
+      }
+      throw e;
+    }
+
+    resetInteractionState();
+    pendingStamps = [];
+    clearHistory();
+    replaceLayers(loadedLayers, manifest.activeLayerId);
+    updateNextLayerNumber();
+    zoom = clamp(manifest.view.zoom, MIN_ZOOM, MAX_ZOOM);
+    offsetX = manifest.view.offsetX;
+    offsetY = manifest.view.offsetY;
+    color = manifest.brush.color;
+    brushSize = clamp(Math.round(manifest.brush.size), 1, 500);
+    hasFitInitialView = true;
+    scheduleFrame();
   }
 
   function rebuildComposite(encoder: GPUCommandEncoder) {

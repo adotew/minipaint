@@ -1,13 +1,25 @@
-import { app, BrowserWindow, Menu } from "electron";
+import { app, BrowserWindow, Menu, dialog, ipcMain } from "electron";
 import { fileURLToPath } from "url";
+import { promises as fs } from "fs";
 import path from "path";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isMac = process.platform === "darwin";
 
+function getTargetWindow(win) {
+  return BrowserWindow.getFocusedWindow() ?? win;
+}
+
 function sendExportPngCommand(win) {
-  const targetWindow = BrowserWindow.getFocusedWindow() ?? win;
-  targetWindow?.webContents.send("menu:export-png");
+  getTargetWindow(win)?.webContents.send("menu:export-png");
+}
+
+function sendSaveProjectCommand(win) {
+  getTargetWindow(win)?.webContents.send("menu:save-project");
+}
+
+function sendOpenProjectCommand(win) {
+  getTargetWindow(win)?.webContents.send("menu:open-project");
 }
 
 function createApplicationMenu(win) {
@@ -33,6 +45,17 @@ function createApplicationMenu(win) {
     {
       label: "File",
       submenu: [
+        {
+          label: "Open Project…",
+          accelerator: "CmdOrCtrl+O",
+          click: () => sendOpenProjectCommand(win),
+        },
+        {
+          label: "Save Project…",
+          accelerator: "CmdOrCtrl+S",
+          click: () => sendSaveProjectCommand(win),
+        },
+        { type: "separator" },
         {
           label: "Export",
           submenu: [
@@ -102,6 +125,37 @@ function createApplicationMenu(win) {
 
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
+
+ipcMain.handle("project:save", async (event, bytes) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showSaveDialog(win ?? undefined, {
+    title: "Save Project",
+    defaultPath: "Untitled.minipaint",
+    filters: [{ name: "minipaint Project", extensions: ["minipaint"] }],
+  });
+
+  if (result.canceled || !result.filePath) return false;
+
+  const filePath = result.filePath.endsWith(".minipaint")
+    ? result.filePath
+    : `${result.filePath}.minipaint`;
+  await fs.writeFile(filePath, Buffer.from(bytes));
+  return true;
+});
+
+ipcMain.handle("project:open", async (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(win ?? undefined, {
+    title: "Open Project",
+    properties: ["openFile"],
+    filters: [{ name: "minipaint Project", extensions: ["minipaint"] }],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) return null;
+
+  const bytes = await fs.readFile(result.filePaths[0]);
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+});
 
 function createWindow() {
   const win = new BrowserWindow({

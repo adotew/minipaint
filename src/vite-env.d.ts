@@ -9,5 +9,9 @@ declare module "*?raw" {
 interface Window {
   minipaint?: {
     onExportPng: (callback: () => void) => () => void;
+    onSaveProject: (callback: () => void) => () => void;
+    onOpenProject: (callback: () => void) => () => void;
+    saveProjectFile: (bytes: ArrayBuffer) => Promise<boolean>;
+    openProjectFile: () => Promise<ArrayBuffer | null>;
   };
 }
