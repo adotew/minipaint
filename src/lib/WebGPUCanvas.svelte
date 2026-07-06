@@ -67,11 +67,20 @@
     activeAfter: LayerId | null;
   };
 
+  type LayerReorderHistoryEntry = {
+    kind: "layer-reorder";
+    beforeOrder: LayerId[];
+    afterOrder: LayerId[];
+    activeBefore: LayerId | null;
+    activeAfter: LayerId | null;
+  };
+
   type HistoryEntry =
     | PaintHistoryEntry
     | LayerMetadataHistoryEntry
     | LayerAddHistoryEntry
-    | LayerDeleteHistoryEntry;
+    | LayerDeleteHistoryEntry
+    | LayerReorderHistoryEntry;
 
   const CANVAS_WIDTH = 4000;
   const CANVAS_HEIGHT = 4000;
@@ -532,6 +541,13 @@
     activeLayerId = entry.activeAfter;
   }
 
+  function reorderLayerStack(order: LayerId[]) {
+    const byId = new Map(layers.map((layer) => [layer.id, layer]));
+    layers = order
+      .map((id) => byId.get(id))
+      .filter((layer): layer is PaintLayer => Boolean(layer));
+  }
+
   function removeLayerById(layerId: LayerId) {
     const index = layers.findIndex((layer) => layer.id === layerId);
     if (index < 0) return;
@@ -559,6 +575,9 @@
       const index = Math.min(entry.index, layers.length);
       layers.splice(index, 0, createPaintLayer(device, entry.metadata, entry.pixels));
       activeLayerId = entry.activeBefore;
+    } else if (entry.kind === "layer-reorder") {
+      reorderLayerStack(entry.beforeOrder);
+      activeLayerId = entry.activeBefore;
     }
 
     syncLayerList();
@@ -580,6 +599,9 @@
       restoreLayerAdd(entry);
     } else if (entry.kind === "layer-delete") {
       removeLayerById(entry.layerId);
+      activeLayerId = entry.activeAfter;
+    } else if (entry.kind === "layer-reorder") {
+      reorderLayerStack(entry.afterOrder);
       activeLayerId = entry.activeAfter;
     }
 
@@ -664,6 +686,29 @@
     if (!layers.some((layer) => layer.id === id)) return;
     activeLayerId = id;
     syncLayerList();
+  }
+
+  export function setLayerOrder(topToBottomIds: LayerId[]) {
+    if (topToBottomIds.length !== layers.length) return;
+
+    const currentIds = new Set(layers.map((layer) => layer.id));
+    if (!topToBottomIds.every((id) => currentIds.has(id))) return;
+
+    const beforeOrder = layers.map((layer) => layer.id);
+    const afterOrder = topToBottomIds.slice().reverse();
+    if (beforeOrder.join("\0") === afterOrder.join("\0")) return;
+
+    reorderLayerStack(afterOrder);
+    syncLayerList();
+    markCompositeDirty();
+    pushHistoryEntry({
+      kind: "layer-reorder",
+      beforeOrder,
+      afterOrder,
+      activeBefore: activeLayerId,
+      activeAfter: activeLayerId,
+    });
+    scheduleFrame();
   }
 
   function updateLayerMetadata(id: LayerId, update: (layer: PaintLayer) => void) {
@@ -1679,6 +1724,7 @@
     layers={layerList}
     ondelete={deleteLayer}
     onselect={setActiveLayer}
+    onreorder={setLayerOrder}
     onvisiblechange={setLayerVisible}
     onnamechange={setLayerName}
     onlockedchange={setLayerLocked}

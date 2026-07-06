@@ -13,6 +13,7 @@
     layers: LayerListItem[];
     ondelete: (id: string) => void;
     onselect: (id: string) => void;
+    onreorder: (topToBottomIds: string[]) => void;
     onvisiblechange: (id: string, visible: boolean) => void;
     onnamechange: (id: string, name: string) => void;
     onlockedchange: (id: string, locked: boolean) => void;
@@ -22,6 +23,7 @@
     layers,
     ondelete,
     onselect,
+    onreorder,
     onvisiblechange,
     onnamechange,
     onlockedchange,
@@ -36,6 +38,10 @@
   let contextMenu = $state<{ layer: LayerListItem; x: number; y: number } | null>(null);
   let renamingLayerId = $state<string | null>(null);
   let renameValue = $state("");
+  let draggedLayerId = $state<string | null>(null);
+  let dropTargetLayerId = $state<string | null>(null);
+  let dropPosition = $state<"before" | "after">("before");
+  let suppressNextClick = false;
 
   let visibleLayers = $derived(layers.slice().reverse());
   let canDelete = $derived(layers.length > 1);
@@ -112,10 +118,76 @@
     }
   }
 
+  function onLayerClick(id: string) {
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      return;
+    }
+
+    selectLayer(id);
+  }
+
   function onLayerKeyDown(e: KeyboardEvent, id: string) {
     if (e.key !== "Enter" && e.key !== " ") return;
     e.preventDefault();
     selectLayer(id);
+  }
+
+  function onLayerDragStart(e: DragEvent, layer: LayerListItem) {
+    if (renamingLayerId === layer.id) {
+      e.preventDefault();
+      return;
+    }
+
+    contextMenu = null;
+    draggedLayerId = layer.id;
+    suppressNextClick = true;
+    e.dataTransfer?.setData("text/plain", layer.id);
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+  }
+
+  function updateDropIndicator(e: DragEvent, targetLayer: LayerListItem) {
+    if (!draggedLayerId || draggedLayerId === targetLayer.id) {
+      dropTargetLayerId = null;
+      return;
+    }
+
+    const rect = e.currentTarget instanceof HTMLElement
+      ? e.currentTarget.getBoundingClientRect()
+      : null;
+
+    dropTargetLayerId = targetLayer.id;
+    dropPosition = rect && e.clientY > rect.top + rect.height / 2 ? "after" : "before";
+  }
+
+  function onLayerDragOver(e: DragEvent, targetLayer: LayerListItem) {
+    if (!draggedLayerId) return;
+    e.preventDefault();
+    updateDropIndicator(e, targetLayer);
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+  }
+
+  function onLayerDrop(e: DragEvent, targetLayer: LayerListItem) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const sourceId = draggedLayerId ?? e.dataTransfer?.getData("text/plain");
+    draggedLayerId = null;
+    dropTargetLayerId = null;
+    if (!sourceId || sourceId === targetLayer.id) return;
+
+    const nextOrder = visibleLayers.map((layer) => layer.id).filter((id) => id !== sourceId);
+    const targetIndex = nextOrder.indexOf(targetLayer.id);
+    if (targetIndex < 0) return;
+
+    const insertAfterTarget = dropPosition === "after";
+    nextOrder.splice(targetIndex + (insertAfterTarget ? 1 : 0), 0, sourceId);
+    onreorder(nextOrder);
+  }
+
+  function onLayerDragEnd() {
+    draggedLayerId = null;
+    dropTargetLayerId = null;
   }
 
   function toggleVisibility(layer: LayerListItem) {
@@ -183,11 +255,22 @@
       <div
         role="button"
         tabindex="0"
-        class="cursor-pointer rounded-md border px-2 py-1.5 text-left transition {layer.active ? 'border-zinc-600 bg-zinc-800/50' : 'border-zinc-800 bg-zinc-950/70 hover:bg-zinc-800/40'}"
-        onclick={() => selectLayer(layer.id)}
+        draggable={renamingLayerId !== layer.id}
+        class="relative cursor-grab rounded-md border px-2 py-1.5 text-left transition active:cursor-grabbing {draggedLayerId === layer.id ? 'opacity-50' : ''} {layer.active ? 'border-zinc-600 bg-zinc-800/50' : 'border-zinc-800 bg-zinc-950/70 hover:bg-zinc-800/40'}"
+        onclick={() => onLayerClick(layer.id)}
         onkeydown={(e) => onLayerKeyDown(e, layer.id)}
         oncontextmenu={(e) => openLayerMenu(e, layer)}
+        ondragstart={(e) => onLayerDragStart(e, layer)}
+        ondragover={(e) => onLayerDragOver(e, layer)}
+        ondrop={(e) => onLayerDrop(e, layer)}
+        ondragend={onLayerDragEnd}
       >
+        {#if dropTargetLayerId === layer.id && dropPosition === "before"}
+          <div class="pointer-events-none absolute -top-1 left-1 right-1 h-0.5 rounded-full bg-zinc-300"></div>
+        {/if}
+        {#if dropTargetLayerId === layer.id && dropPosition === "after"}
+          <div class="pointer-events-none absolute -bottom-1 left-1 right-1 h-0.5 rounded-full bg-zinc-300"></div>
+        {/if}
         {#if renamingLayerId === layer.id}
           <input
             bind:this={renameInputEl}
