@@ -13,6 +13,7 @@ export const PRESSURE_OPACITY_GAMMA = 1.35;
 export const STAMP_SPACING_RATIO = 0.25;
 export const MIN_STAMP_SPACING = 1;
 export const BRUSH_STAMP_ASPECT = 500 / 500;
+export const MAX_BRUSH_SIZE = 2000;
 export const PRESSURE_FALLBACK = 0.5;
 export const PRESSURE_EPSILON = 0.001;
 

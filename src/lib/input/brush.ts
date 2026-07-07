@@ -1,4 +1,5 @@
 import {
+  MAX_BRUSH_SIZE,
   MIN_PRESSURE_OPACITY,
   MIN_PRESSURE_SIZE,
   PRESSURE_EPSILON,
@@ -71,5 +72,5 @@ export function getBrushPreviewRadius(options: {
 }
 
 export function resizeBrushSize(startBrushSize: number, startY: number, currentY: number) {
-  return Math.round(clamp(startBrushSize - (currentY - startY), 1, 500));
+  return Math.round(clamp(startBrushSize - (currentY - startY), 1, MAX_BRUSH_SIZE));
 }

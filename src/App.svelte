@@ -18,7 +18,7 @@
   } from "./lib/app/recentFiles";
 
   let color = $state("#aabbcc");
-  let brushSize = $state(10);
+  let brushSize = $state(300);
 
   type CanvasHandle = {
     newProject: (width?: number, height?: number) => void;

@@ -7,6 +7,7 @@
   import {
     DEFAULT_CANVAS_HEIGHT,
     DEFAULT_CANVAS_WIDTH,
+    MAX_BRUSH_SIZE,
     MAX_CANVAS_SIZE,
     MAX_ZOOM,
     MIN_CANVAS_SIZE,
@@ -391,7 +392,7 @@
     offsetX = manifest.view.offsetX;
     offsetY = manifest.view.offsetY;
     color = manifest.brush.color;
-    brushSize = clamp(Math.round(manifest.brush.size), 1, 500);
+    brushSize = clamp(Math.round(manifest.brush.size), 1, MAX_BRUSH_SIZE);
     toolMode = "brush";
     hasFitInitialView = true;
     scheduleFrame();
