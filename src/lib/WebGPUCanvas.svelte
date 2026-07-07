@@ -1,6 +1,8 @@
 <script lang="ts">
   /// <reference types="@webgpu/types" />
 
+  import BrushPreview from "./BrushPreview.svelte";
+  import CanvasStatus from "./CanvasStatus.svelte";
   import LayerPanel from "./LayerPanel.svelte";
   import {
     DEFAULT_CANVAS_HEIGHT,
@@ -1437,15 +1439,13 @@
   ></canvas>
 
   {#if brushPreviewVisible}
-    <div
-      class="pointer-events-none absolute"
-      style="left: {brushPreviewX}px; top: {brushPreviewY}px; width: {brushPreviewWidth}px; height: {brushPreviewHeight}px; transform: translate(-50%, -50%);"
-    >
-      <div
-        class="absolute inset-0"
-        style="background: rgba(255, 255, 255, 0.01); -webkit-backdrop-filter: invert(1); backdrop-filter: invert(1); -webkit-mask: url('{brushStampOutlineUrl}') center / contain no-repeat; mask: url('{brushStampOutlineUrl}') center / contain no-repeat; filter: drop-shadow(0 0 1px rgba(255, 255, 255, 0.9)) drop-shadow(0 0 2px rgba(0, 0, 0, 0.7));"
-      ></div>
-    </div>
+    <BrushPreview
+      x={brushPreviewX}
+      y={brushPreviewY}
+      width={brushPreviewWidth}
+      height={brushPreviewHeight}
+      maskUrl={brushStampOutlineUrl}
+    />
   {/if}
 
   <LayerPanel
@@ -1458,7 +1458,5 @@
     onlockedchange={setLayerLocked}
   />
 
-  <div class="pointer-events-none absolute bottom-2 right-2 rounded bg-black/60 px-2 py-0.5 text-xs text-white">
-    {Math.round(zoom * 100)}% · {brushSize}px
-  </div>
+  <CanvasStatus {zoom} {brushSize} />
 </div>
