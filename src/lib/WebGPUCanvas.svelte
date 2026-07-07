@@ -24,7 +24,6 @@
     captureLayerMetadata,
     createLayerList,
     getNextLayerNumber,
-    makeLayerId,
     type LayerListItem,
     type PaintLayer,
   } from "./document/layers";
@@ -35,6 +34,8 @@
     createViewUniformBuffer,
   } from "./gpu/buffers";
   import { createBrushStampTexture, loadBrushStampBitmap } from "./gpu/brushStamp";
+  import { createCompositeTextureResources } from "./gpu/compositeResources";
+  import { createPaintLayerResource, destroyPaintLayerResource } from "./gpu/layerResources";
   import {
     createCompositePipelineResources,
     createStampPipelineResources,
@@ -48,7 +49,6 @@
     writeViewUniforms as writeGpuViewUniforms,
   } from "./gpu/rendering";
   import {
-    clearTexture,
     copyTexture,
     createDocumentTexture,
     readTexturePixels,
@@ -238,20 +238,18 @@
     }
 
     const oldCompositeTexture = compositeTexture;
-    const texture = createDocumentTexture(dev, documentWidth, documentHeight, "Composite texture");
-    const view = texture.createView();
-    const bindGroup = dev.createBindGroup({
-      layout: renderBindGroupLayout,
-      entries: [
-        { binding: 0, resource: paintSampler },
-        { binding: 1, resource: view },
-        { binding: 2, resource: { buffer: viewUniformBuffer } },
-      ],
+    const resources = createCompositeTextureResources({
+      device: dev,
+      width: documentWidth,
+      height: documentHeight,
+      renderBindGroupLayout,
+      paintSampler,
+      viewUniformBuffer,
     });
 
-    compositeTexture = texture;
-    compositeTextureView = view;
-    renderBindGroup = bindGroup;
+    compositeTexture = resources.texture;
+    compositeTextureView = resources.view;
+    renderBindGroup = resources.renderBindGroup;
     oldCompositeTexture?.destroy();
     markCompositeDirty();
   }
@@ -269,38 +267,21 @@
       throw new Error("Layer compositing is not ready.");
     }
 
-    const layerId = metadata?.id ?? makeLayerId();
-    const texture = createDocumentTexture(dev, documentWidth, documentHeight, `Paint layer ${layerId}`);
-    const view = texture.createView();
-    const compositeBindGroup = dev.createBindGroup({
-      layout: compositeBindGroupLayout,
-      entries: [
-        { binding: 0, resource: compositeSampler },
-        { binding: 1, resource: view },
-      ],
+    const fallbackName = metadata?.name ?? `Layer ${nextLayerNumber++}`;
+    return createPaintLayerResource({
+      device: dev,
+      width: documentWidth,
+      height: documentHeight,
+      compositeBindGroupLayout,
+      compositeSampler,
+      metadata,
+      fallbackName,
+      sourcePixels,
     });
-
-    const layer: PaintLayer = {
-      id: layerId,
-      name: metadata?.name ?? `Layer ${nextLayerNumber++}`,
-      texture,
-      view,
-      compositeBindGroup,
-      visible: metadata?.visible ?? true,
-      locked: metadata?.locked ?? false,
-    };
-
-    if (sourcePixels) {
-      restoreTexture(dev, texture, sourcePixels, documentWidth, documentHeight);
-    } else {
-      clearTexture(dev, texture, [0, 0, 0, 0]);
-    }
-
-    return layer;
   }
 
   function destroyLayer(layer: PaintLayer) {
-    layer.texture.destroy();
+    destroyPaintLayerResource(layer);
   }
 
   function syncLayerList() {
