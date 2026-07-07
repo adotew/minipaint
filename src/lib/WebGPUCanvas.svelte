@@ -341,7 +341,7 @@
 
     if (currentStrokeHistory && strokeHadPaint) {
       history.push({
-        kind: "paint"},{
+        kind: "paint",
         layerId: currentStrokeHistory.layerId,
         before: currentStrokeHistory.before,
         redo: null,
@@ -471,7 +471,7 @@
     syncLayerList();
     markCompositeDirty();
     history.push({
-      kind: "layer-add"},{
+      kind: "layer-add",
       layerId: layer.id,
       index,
       metadata: captureLayerMetadata(layer),
@@ -499,7 +499,7 @@
     syncLayerList();
     markCompositeDirty();
     history.push({
-      kind: "layer-delete"},{
+      kind: "layer-delete",
       layerId: metadata.id,
       index,
       metadata,
@@ -530,7 +530,7 @@
     syncLayerList();
     markCompositeDirty();
     history.push({
-      kind: "layer-reorder"},{
+      kind: "layer-reorder",
       beforeOrder,
       afterOrder,
       activeBefore: activeLayerId,
