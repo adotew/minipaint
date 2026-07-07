@@ -62,6 +62,7 @@
     hasRealPressure,
     resizeBrushSize,
   } from "./input/brush";
+  import { getKeyDownShortcutCommand, getKeyUpShortcutCommand } from "./input/keyboardShortcuts";
   import {
     applyZoomAt,
     fitDocumentToViewport,
@@ -1397,81 +1398,36 @@
   // ====================================================================
 
   $effect(() => {
+    function zoomAroundCenter(factor: number) {
+      const cw = canvasEl?.clientWidth ?? documentWidth;
+      const ch = canvasEl?.clientHeight ?? documentHeight;
+      applyZoom(factor, cw / 2, ch / 2);
+    }
+
     function onKeyDown(e: KeyboardEvent) {
-      const target = e.target as HTMLElement | null;
-      const tag = target?.tagName;
-      if (target?.isContentEditable || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      const command = getKeyDownShortcutCommand(e);
+      if (!command) return;
 
-      if (e.code === "Space" && !e.repeat) {
-        e.preventDefault();
-        isSpaceHeld = true;
-        return;
-      }
-
-      if ((e.code === "AltLeft" || e.code === "AltRight") && !e.repeat) {
-        e.preventDefault();
-        isEyedropperHeld = true;
-        return;
-      }
-
-      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "n") {
-        e.preventDefault();
-        addLayer();
-        return;
-      }
-
-      if ((e.ctrlKey || e.metaKey) && (e.key === "+" || e.key === "=")) {
-        e.preventDefault();
-        const cw = canvasEl?.clientWidth ?? documentWidth;
-        const ch = canvasEl?.clientHeight ?? documentHeight;
-        applyZoom(1.25, cw / 2, ch / 2);
-        return;
-      }
-
-      if ((e.ctrlKey || e.metaKey) && e.key === "-") {
-        e.preventDefault();
-        const cw = canvasEl?.clientWidth ?? documentWidth;
-        const ch = canvasEl?.clientHeight ?? documentHeight;
-        applyZoom(0.8, cw / 2, ch / 2);
-        return;
-      }
-
-      if ((e.ctrlKey || e.metaKey) && e.key === "0") {
-        e.preventDefault();
-        fitToScreen();
-        return;
-      }
-
-      if ((e.ctrlKey || e.metaKey) && e.key === "1") {
-        e.preventDefault();
-        zoomTo100();
-        return;
-      }
-
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
-        e.preventDefault();
-        undo();
-        return;
-      }
-
-      if (
-        (e.ctrlKey || e.metaKey) &&
-        (e.key.toLowerCase() === "y" || (e.key.toLowerCase() === "z" && e.shiftKey))
-      ) {
-        e.preventDefault();
-        redo();
-        return;
-      }
+      e.preventDefault();
+      if (command === "space-down") isSpaceHeld = true;
+      else if (command === "eyedropper-down") isEyedropperHeld = true;
+      else if (command === "add-layer") addLayer();
+      else if (command === "zoom-in") zoomAroundCenter(1.25);
+      else if (command === "zoom-out") zoomAroundCenter(0.8);
+      else if (command === "fit-screen") fitToScreen();
+      else if (command === "zoom-100") zoomTo100();
+      else if (command === "undo") undo();
+      else if (command === "redo") redo();
     }
 
     function onKeyUp(e: KeyboardEvent) {
-      if (e.code === "Space") {
-        e.preventDefault();
-        isSpaceHeld = false;
-      }
+      const command = getKeyUpShortcutCommand(e);
+      if (!command) return;
 
-      if (e.code === "AltLeft" || e.code === "AltRight") {
-        e.preventDefault();
+      e.preventDefault();
+      if (command === "space-up") {
+        isSpaceHeld = false;
+      } else if (command === "eyedropper-up") {
         isEyedropperHeld = false;
         isEyedropping = false;
         cancelEyedropperSample();
