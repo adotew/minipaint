@@ -15,7 +15,7 @@
   import { hexToVec4, withAlpha, type Rgba } from "./core/color";
   import { getStampHalfSize } from "./core/geometry";
   import { clamp } from "./core/math";
-  import type { LayerId } from "./core/types";
+  import type { LayerId, ToolMode } from "./core/types";
   import { type LayerListItem, type PaintLayer } from "./document/layers";
   import { PaintDocumentController } from "./document/paintDocument";
   import { StrokeHistoryManager } from "./document/strokeHistory";
@@ -78,6 +78,8 @@
           ? "grab"
           : "none"
   );
+  let toolMode = $state<ToolMode>("brush");
+  let strokeToolMode: ToolMode = "brush";
   let brushPreviewVisible = $state(false);
   let brushPreviewX = $state(0);
   let brushPreviewY = $state(0);
@@ -215,6 +217,7 @@
     isDrawing = false;
     isPanning = false;
     isResizingBrush = false;
+    isEyedropping = false;
     strokeUsesPressure = false;
     if (renderer) renderer.stampDistanceSinceLastStamp = 0;
   }
@@ -310,6 +313,7 @@
     resetInteractionState();
     renderer.clearStamps();
     clearHistory();
+    toolMode = "brush";
 
     documentWidth = nextWidth;
     documentHeight = nextHeight;
@@ -388,6 +392,7 @@
     offsetY = manifest.view.offsetY;
     color = manifest.brush.color;
     brushSize = clamp(Math.round(manifest.brush.size), 1, 500);
+    toolMode = "brush";
     hasFitInitialView = true;
     scheduleFrame();
     return { width: documentWidth, height: documentHeight };
@@ -398,9 +403,10 @@
     y: number,
     radius: number,
     rgba: Rgba,
+    mode: ToolMode,
   ) {
     syncRendererViewState();
-    const queued = renderer?.queueStamp(x, y, radius, rgba) ?? false;
+    const queued = renderer?.queueStamp(x, y, radius, rgba, mode) ?? false;
     if (!queued) return false;
 
     if (isDrawing) strokeHistory.markPainted();
@@ -417,9 +423,10 @@
     r2: number,
     o2: number,
     rgba: Rgba,
+    mode: ToolMode,
   ) {
     syncRendererViewState();
-    const queued = renderer?.stampLine({ x1, y1, r1, o1, x2, y2, r2, o2, rgba }) ?? false;
+    const queued = renderer?.stampLine({ x1, y1, r1, o1, x2, y2, r2, o2, rgba, mode }) ?? false;
     if (!queued) return;
 
     if (isDrawing) strokeHistory.markPainted();
@@ -663,6 +670,7 @@
       if (!renderer || !activeLayer || !activeLayer.visible || activeLayer.locked) return;
 
       isDrawing = true;
+      strokeToolMode = toolMode;
       strokeUsesPressure = hasRealPressure(e);
       strokeHistory.begin(
         activeLayer.id,
@@ -678,7 +686,7 @@
       const rgba = hexToVec4(color);
       lastPoint = { x, y, radius, opacity };
       renderer.stampDistanceSinceLastStamp = 0;
-      queueStamp(x, y, radius, withAlpha(rgba, opacity));
+      queueStamp(x, y, radius, withAlpha(rgba, opacity), strokeToolMode);
       canvas.setPointerCapture(e.pointerId);
     }
   }
@@ -732,6 +740,7 @@
       radius,
       opacity,
       hexToVec4(color),
+      strokeToolMode,
     );
     lastPoint = { x, y, radius, opacity };
   }
@@ -824,6 +833,8 @@
       e.preventDefault();
       if (command === "space-down") isSpaceHeld = true;
       else if (command === "eyedropper-down") isEyedropperHeld = true;
+      else if (command === "brush-mode") toolMode = "brush";
+      else if (command === "eraser-mode") toolMode = "eraser";
       else if (command === "add-layer") addLayer();
       else if (command === "zoom-in") zoomAroundCenter(1.25);
       else if (command === "zoom-out") zoomAroundCenter(0.8);
@@ -895,5 +906,5 @@
     onlockedchange={setLayerLocked}
   />
 
-  <CanvasStatus {zoom} {brushSize} />
+  <CanvasStatus {zoom} {brushSize} {toolMode} />
 </div>

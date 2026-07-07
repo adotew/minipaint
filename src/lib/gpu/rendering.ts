@@ -1,12 +1,14 @@
 import { FLOATS_PER_STAMP } from "../core/constants";
 import type { Rgba } from "../core/color";
 import { getStampBounds } from "../core/geometry";
+import type { ToolMode } from "../core/types";
 
 export type Stamp = {
   x: number;
   y: number;
   radius: number;
   rgba: Rgba;
+  mode: ToolMode;
 };
 
 export type StampTargetLayer = {
@@ -90,6 +92,7 @@ export function renderStamps(options: {
   documentHeight: number;
   activeLayer: StampTargetLayer | null;
   stampPipeline: GPURenderPipeline;
+  eraserStampPipeline: GPURenderPipeline;
   stampBindGroup: GPUBindGroup;
 }) {
   const activeLayer = options.activeLayer;
@@ -119,9 +122,21 @@ export function renderStamps(options: {
       },
     ],
   });
-  pass.setPipeline(options.stampPipeline);
   pass.setBindGroup(0, options.stampBindGroup);
-  pass.draw(6, options.count);
+
+  let runStart = 0;
+  while (runStart < options.count) {
+    const mode = options.stamps[runStart].mode;
+    let runEnd = runStart + 1;
+    while (runEnd < options.count && options.stamps[runEnd].mode === mode) {
+      runEnd++;
+    }
+
+    pass.setPipeline(mode === "eraser" ? options.eraserStampPipeline : options.stampPipeline);
+    pass.draw(6, runEnd - runStart, 0, runStart);
+    runStart = runEnd;
+  }
+
   pass.end();
   return true;
 }

@@ -26,6 +26,7 @@ export type GpuCanvasResources = {
   viewUniformBuffer: GPUBuffer;
   eyedropperReadBuffer: GPUBuffer;
   stampPipeline: GPURenderPipeline;
+  eraserStampPipeline: GPURenderPipeline;
   compositePipeline: GPURenderPipeline;
   renderPipeline: GPURenderPipeline;
   stampBindGroup: GPUBindGroup;
@@ -144,6 +145,7 @@ export async function initializeGpuCanvas(options: {
     viewUniformBuffer,
     eyedropperReadBuffer,
     stampPipeline: stampResources.pipeline,
+    eraserStampPipeline: stampResources.eraserPipeline,
     compositePipeline: compositeResources.pipeline,
     renderPipeline: viewportResources.pipeline,
     stampBindGroup: stampResources.bindGroup,

@@ -1,6 +1,7 @@
 import type { Rgba } from "../core/color";
 import { withAlpha } from "../core/color";
 import { getStampBounds, getStampSpacing } from "../core/geometry";
+import type { ToolMode } from "../core/types";
 import { lerp } from "../core/math";
 import type { Stamp } from "../gpu/rendering";
 
@@ -32,6 +33,7 @@ export class StampQueue {
     y: number,
     radius: number,
     rgba: Rgba,
+    mode: ToolMode,
     documentWidth: number,
     documentHeight: number,
   ) {
@@ -54,7 +56,7 @@ export class StampQueue {
       return false;
     }
 
-    this.pending.push({ x, y, radius, rgba });
+    this.pending.push({ x, y, radius, rgba, mode });
     return true;
   }
 
@@ -68,6 +70,7 @@ export class StampQueue {
     r2: number;
     o2: number;
     rgba: Rgba;
+    mode: ToolMode;
     documentWidth: number;
     documentHeight: number;
   }) {
@@ -99,6 +102,7 @@ export class StampQueue {
         options.y1 + dy * t,
         radius,
         withAlpha(options.rgba, opacity),
+        options.mode,
         options.documentWidth,
         options.documentHeight,
       )) {

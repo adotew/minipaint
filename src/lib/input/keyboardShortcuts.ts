@@ -3,6 +3,8 @@ export type KeyboardShortcutCommand =
   | "space-up"
   | "eyedropper-down"
   | "eyedropper-up"
+  | "brush-mode"
+  | "eraser-mode"
   | "add-layer"
   | "zoom-in"
   | "zoom-out"
@@ -28,10 +30,15 @@ export function getKeyDownShortcutCommand(e: KeyboardEvent): KeyboardShortcutCom
   if (e.code === "Space" && !e.repeat) return "space-down";
   if ((e.code === "AltLeft" || e.code === "AltRight") && !e.repeat) return "eyedropper-down";
 
+  const key = e.key.toLowerCase();
+  if (!e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (key === "b") return "brush-mode";
+    if (key === "e") return "eraser-mode";
+  }
+
   const commandKey = e.ctrlKey || e.metaKey;
   if (!commandKey) return null;
 
-  const key = e.key.toLowerCase();
   if (!e.shiftKey && key === "n") return "add-layer";
   if (e.key === "+" || e.key === "=") return "zoom-in";
   if (e.key === "-") return "zoom-out";

@@ -1,6 +1,6 @@
 import { MAX_STAMPS_PER_FRAME } from "../core/constants";
 import type { Rgba } from "../core/color";
-import type { LayerMetadata } from "../core/types";
+import type { LayerMetadata, ToolMode } from "../core/types";
 import type { PaintLayer } from "../document/layers";
 import { pixelsToPngBlob } from "../persistence/png";
 import { createCompositeTextureResources } from "./compositeResources";
@@ -49,6 +49,7 @@ export class GpuPaintRenderer {
   private viewUniformBuffer: GPUBuffer;
   private eyedropperReadBuffer: GPUBuffer;
   private stampPipeline: GPURenderPipeline;
+  private eraserStampPipeline: GPURenderPipeline;
   private compositePipeline: GPURenderPipeline;
   private renderPipeline: GPURenderPipeline;
   private stampBindGroup: GPUBindGroup;
@@ -82,6 +83,7 @@ export class GpuPaintRenderer {
     this.viewUniformBuffer = resources.viewUniformBuffer;
     this.eyedropperReadBuffer = resources.eyedropperReadBuffer;
     this.stampPipeline = resources.stampPipeline;
+    this.eraserStampPipeline = resources.eraserStampPipeline;
     this.compositePipeline = resources.compositePipeline;
     this.renderPipeline = resources.renderPipeline;
     this.stampBindGroup = resources.stampBindGroup;
@@ -186,8 +188,8 @@ export class GpuPaintRenderer {
     this.stampQueue.clear();
   }
 
-  queueStamp(x: number, y: number, radius: number, rgba: Rgba) {
-    const queued = this.stampQueue.queueStamp(x, y, radius, rgba, this.documentWidth, this.documentHeight);
+  queueStamp(x: number, y: number, radius: number, rgba: Rgba, mode: ToolMode) {
+    const queued = this.stampQueue.queueStamp(x, y, radius, rgba, mode, this.documentWidth, this.documentHeight);
     if (!queued) return false;
 
     this.scheduleFrame();
@@ -204,6 +206,7 @@ export class GpuPaintRenderer {
     r2: number;
     o2: number;
     rgba: Rgba;
+    mode: ToolMode;
   }) {
     const queued = this.stampQueue.stampLine({
       ...options,
@@ -273,6 +276,7 @@ export class GpuPaintRenderer {
         documentHeight: this.documentHeight,
         activeLayer: this.callbacks.getActiveLayer(),
         stampPipeline: this.stampPipeline,
+        eraserStampPipeline: this.eraserStampPipeline,
         stampBindGroup: this.stampBindGroup,
       });
       if (rendered) {

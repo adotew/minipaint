@@ -4,6 +4,7 @@ import compositeShaderCode from "../shaders/composite.wgsl?raw";
 
 export type StampPipelineResources = {
   pipeline: GPURenderPipeline;
+  eraserPipeline: GPURenderPipeline;
   bindGroup: GPUBindGroup;
 };
 
@@ -34,11 +35,12 @@ export function createStampPipelineResources(
     ],
   });
 
+  const pipelineLayout = dev.createPipelineLayout({
+    bindGroupLayouts: [bindGroupLayout],
+  });
   const stampShaderModule = dev.createShaderModule({ code: stampShaderCode });
-  const pipeline = dev.createRenderPipeline({
-    layout: dev.createPipelineLayout({
-      bindGroupLayouts: [bindGroupLayout],
-    }),
+  const createPipeline = (blend: GPUBlendState) => dev.createRenderPipeline({
+    layout: pipelineLayout,
     vertex: {
       module: stampShaderModule,
       entryPoint: "vs",
@@ -49,22 +51,35 @@ export function createStampPipelineResources(
       targets: [
         {
           format: "rgba8unorm",
-          blend: {
-            color: {
-              operation: "add",
-              srcFactor: "src-alpha",
-              dstFactor: "one-minus-src-alpha",
-            },
-            alpha: {
-              operation: "add",
-              srcFactor: "one",
-              dstFactor: "one-minus-src-alpha",
-            },
-          },
+          blend,
         },
       ],
     },
     primitive: { topology: "triangle-list" },
+  });
+  const pipeline = createPipeline({
+    color: {
+      operation: "add",
+      srcFactor: "src-alpha",
+      dstFactor: "one-minus-src-alpha",
+    },
+    alpha: {
+      operation: "add",
+      srcFactor: "one",
+      dstFactor: "one-minus-src-alpha",
+    },
+  });
+  const eraserPipeline = createPipeline({
+    color: {
+      operation: "add",
+      srcFactor: "zero",
+      dstFactor: "one-minus-src-alpha",
+    },
+    alpha: {
+      operation: "add",
+      srcFactor: "zero",
+      dstFactor: "one-minus-src-alpha",
+    },
   });
 
   const bindGroup = dev.createBindGroup({
@@ -77,7 +92,7 @@ export function createStampPipelineResources(
     ],
   });
 
-  return { pipeline, bindGroup };
+  return { pipeline, eraserPipeline, bindGroup };
 }
 
 export function createCompositePipelineResources(dev: GPUDevice): CompositePipelineResources {
