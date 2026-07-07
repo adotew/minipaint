@@ -1,13 +1,6 @@
 <script lang="ts">
   import { tick } from "svelte";
-
-  export type LayerListItem = {
-    id: string;
-    name: string;
-    visible: boolean;
-    locked: boolean;
-    active: boolean;
-  };
+  import type { LayerListItem } from "./document/layers";
 
   interface Props {
     layers: LayerListItem[];

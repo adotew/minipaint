@@ -1,7 +1,7 @@
 <script lang="ts">
   /// <reference types="@webgpu/types" />
 
-  import LayerPanel, { type LayerListItem } from "./LayerPanel.svelte";
+  import LayerPanel from "./LayerPanel.svelte";
   import {
     COPY_BYTES_PER_ROW_ALIGNMENT,
     DEFAULT_CANVAS_HEIGHT,
@@ -23,6 +23,15 @@
   import { clamp, lerp } from "./core/math";
   import type { LayerId, LayerMetadata } from "./core/types";
   import { HistoryManager, type HistoryEntry, type LayerAddHistoryEntry } from "./document/history";
+  import {
+    applyLayerMetadata,
+    captureLayerMetadata,
+    createLayerList,
+    getNextLayerNumber,
+    makeLayerId,
+    type LayerListItem,
+    type PaintLayer,
+  } from "./document/layers";
   import {
     createEyedropperReadBuffer,
     createStampBuffer,
@@ -60,16 +69,6 @@
   }
 
   let { color = $bindable(), brushSize = $bindable() }: Props = $props();
-
-  type PaintLayer = {
-    id: LayerId;
-    name: string;
-    texture: GPUTexture;
-    view: GPUTextureView;
-    compositeBindGroup: GPUBindGroup;
-    visible: boolean;
-    locked: boolean;
-  };
 
   // ---- DOM binding ----
   let canvasEl: HTMLCanvasElement | undefined = $state();
@@ -246,27 +245,8 @@
     markCompositeDirty();
   }
 
-  function makeLayerId(): LayerId {
-    return `layer-${crypto.randomUUID()}`;
-  }
-
   function getActiveLayer() {
     return layers.find((layer) => layer.id === activeLayerId) ?? null;
-  }
-
-  function captureLayerMetadata(layer: PaintLayer): LayerMetadata {
-    return {
-      id: layer.id,
-      name: layer.name,
-      visible: layer.visible,
-      locked: layer.locked,
-    };
-  }
-
-  function applyLayerMetadata(layer: PaintLayer, metadata: LayerMetadata) {
-    layer.name = metadata.name;
-    layer.visible = metadata.visible;
-    layer.locked = metadata.locked;
   }
 
   function createPaintLayer(
@@ -313,13 +293,7 @@
   }
 
   function syncLayerList() {
-    layerList = layers.map((layer) => ({
-      id: layer.id,
-      name: layer.name,
-      visible: layer.visible,
-      locked: layer.locked,
-      active: layer.id === activeLayerId,
-    }));
+    layerList = createLayerList(layers, activeLayerId);
   }
 
   function markCompositeDirty() {
@@ -348,12 +322,7 @@
   }
 
   function updateNextLayerNumber() {
-    let maxLayerNumber = 0;
-    for (const layer of layers) {
-      const match = /^Layer (\d+)$/.exec(layer.name);
-      if (match) maxLayerNumber = Math.max(maxLayerNumber, Number(match[1]));
-    }
-    nextLayerNumber = Math.max(maxLayerNumber + 1, layers.length + 1);
+    nextLayerNumber = getNextLayerNumber(layers);
   }
 
   function finalizePendingPaintHistory() {
