@@ -28,4 +28,7 @@ contextBridge.exposeInMainWorld("minipaint", {
   openRecentProjectFile(path) {
     return ipcRenderer.invoke("project:open-recent", path);
   },
+  renameProjectFile(oldPath, newName) {
+    return ipcRenderer.invoke("project:rename", oldPath, newName);
+  },
 });

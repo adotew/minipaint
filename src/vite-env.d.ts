@@ -15,5 +15,6 @@ interface Window {
     saveProjectFile: (bytes: ArrayBuffer, path?: string | null) => Promise<string | null>;
     openProjectFile: () => Promise<{ path: string; bytes: ArrayBuffer } | null>;
     openRecentProjectFile: (path: string) => Promise<{ path: string; bytes: ArrayBuffer } | null>;
+    renameProjectFile: (oldPath: string, newName: string) => Promise<string | null>;
   };
 }

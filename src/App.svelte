@@ -39,6 +39,8 @@
   let recentFiles = $state<RecentFile[]>([]);
   let currentProjectPath = $state<string | null>(null);
   let recentMenuPath = $state<string | null>(null);
+  let renamingPath = $state<string | null>(null);
+  let renameDraft = $state("");
 
   // Panel drag state
   let translate = $state({ x: 0, y: 0 });
@@ -81,6 +83,11 @@
     return path.split(/[\\/]/).pop() || path;
   }
 
+  function focusNode(node: HTMLElement) {
+    node.focus();
+    node.select();
+  }
+
   function loadRecentFiles() {
     try {
       const parsed = JSON.parse(localStorage.getItem(RECENT_FILES_KEY) ?? "[]") as unknown;
@@ -108,9 +115,55 @@
   }
 
   function addRecentFile(path: string) {
-    const file = { path, name: fileNameFromPath(path).replace(/\.minipaint$/i, "") };
+    const existing = recentFiles.find((item) => item.path === path);
+    const file = { path, name: existing?.name ?? fileNameFromPath(path).replace(/\.minipaint$/i, "") };
     recentFiles = [file, ...recentFiles.filter((item) => item.path !== path)].slice(0, MAX_RECENT_FILES);
     saveRecentFiles(recentFiles);
+  }
+
+  function startRename(path: string, currentName: string) {
+    renamingPath = path;
+    renameDraft = currentName;
+    recentMenuPath = null;
+  }
+
+  function cancelRename() {
+    renamingPath = null;
+    renameDraft = "";
+  }
+
+  async function confirmRename(path: string) {
+    actionError = null;
+    const newName = renameDraft.trim();
+    if (!newName || recentFiles.find((item) => item.path === path)?.name === newName) {
+      cancelRename();
+      return;
+    }
+
+    try {
+      const rename = window.minipaint?.renameProjectFile;
+      if (rename) {
+        const newPath = await rename(path, newName);
+        if (!newPath) {
+          cancelRename();
+          return;
+        }
+        const updatedName = fileNameFromPath(newPath).replace(/\.minipaint$/i, "");
+        recentFiles = recentFiles.map((item) =>
+          item.path === path ? { path: newPath, name: updatedName } : item,
+        );
+        if (currentProjectPath === path) currentProjectPath = newPath;
+      } else {
+        recentFiles = recentFiles.map((item) =>
+          item.path === path ? { ...item, name: newName } : item,
+        );
+      }
+      saveRecentFiles(recentFiles);
+      cancelRename();
+    } catch (e) {
+      console.error(e);
+      actionError = e instanceof Error ? e.message : "Failed to rename project.";
+    }
   }
 
   function removeRecentFile(path: string) {
@@ -343,33 +396,75 @@
             >
               <div class="relative aspect-[4/3] rounded-lg bg-white shadow-md ring-1 ring-zinc-700/70"></div>
             </button>
-            <div class="mt-3 flex items-center gap-1">
-              <button
-                class="min-w-0 flex-1 truncate text-left text-sm font-medium text-zinc-100"
-                type="button"
-                onclick={() => void openProject(file.path)}
+            {#if renamingPath === file.path}
+              <form
+                class="mt-3 flex items-center gap-1"
+                onsubmit={(e) => {
+                  e.preventDefault();
+                  void confirmRename(file.path);
+                }}
               >
-                {file.name}
-              </button>
-              <button
-                class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100"
-                type="button"
-                aria-label="File options"
-                onclick={(e) => toggleRecentMenu(e, file.path)}
-              >
-                <svg aria-hidden="true" class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
-                  <circle cx="12" cy="5" r="1.8" />
-                  <circle cx="12" cy="12" r="1.8" />
-                  <circle cx="12" cy="19" r="1.8" />
-                </svg>
-              </button>
-            </div>
+                <input
+                  class="min-w-0 flex-1 rounded-md border border-zinc-600 bg-zinc-800 px-2 py-1 text-sm text-zinc-100 outline-none focus:border-zinc-500"
+                  type="text"
+                  use:focusNode
+                  bind:value={renameDraft}
+                  onkeydown={(e) => {
+                    if (e.key === "Escape") cancelRename();
+                  }}
+                />
+                <button
+                  class="shrink-0 rounded-md bg-zinc-100 px-2 py-1 text-xs font-medium text-zinc-900 hover:bg-white"
+                  type="submit"
+                >
+                  Save
+                </button>
+                <button
+                  class="shrink-0 rounded-md px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
+                  type="button"
+                  onclick={cancelRename}
+                >
+                  Cancel
+                </button>
+              </form>
+            {:else}
+              <div class="mt-3 flex items-center gap-1">
+                <button
+                  class="min-w-0 flex-1 truncate text-left text-sm font-medium text-zinc-100"
+                  type="button"
+                  onclick={() => void openProject(file.path)}
+                >
+                  {file.name}
+                </button>
+                <button
+                  class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100"
+                  type="button"
+                  aria-label="File options"
+                  onclick={(e) => toggleRecentMenu(e, file.path)}
+                >
+                  <svg aria-hidden="true" class="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+                    <circle cx="12" cy="5" r="1.8" />
+                    <circle cx="12" cy="12" r="1.8" />
+                    <circle cx="12" cy="19" r="1.8" />
+                  </svg>
+                </button>
+              </div>
+            {/if}
             {#if recentMenuPath === file.path}
               <div
                 class="absolute right-0 top-full z-10 mt-1 min-w-32 rounded-lg border border-zinc-700 bg-zinc-900 p-1 text-sm shadow-xl"
                 role="menu"
                 tabindex="-1"
               >
+                <button
+                  class="block w-full rounded px-2 py-1.5 text-left text-zinc-200 hover:bg-zinc-800"
+                  type="button"
+                  role="menuitem"
+                  onclick={() => startRename(file.path, file.name)}
+                >
+                  Rename
+                </button>
+                <div class="my-1 border-t border-zinc-700"></div>
                 <button
                   class="block w-full rounded px-2 py-1.5 text-left text-zinc-200 hover:bg-zinc-800"
                   type="button"

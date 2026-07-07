@@ -186,6 +186,29 @@ ipcMain.handle("project:open-recent", async (_event, filePath) => {
   return await readProjectFile(filePath);
 });
 
+ipcMain.handle("project:rename", async (_event, oldPath, newName) => {
+  if (typeof oldPath !== "string" || typeof newName !== "string") return null;
+
+  let base = newName.trim().replace(/[\\/]/g, "_");
+  if (!base) return null;
+  if (!base.toLowerCase().endsWith(".minipaint")) base += ".minipaint";
+
+  const dir = path.dirname(oldPath);
+  const newPath = path.join(dir, base);
+  if (newPath === oldPath) return oldPath;
+
+  try {
+    await fs.access(newPath);
+    throw new Error("A file with that name already exists.");
+  } catch (err) {
+    if (err instanceof Error && err.message === "A file with that name already exists.") throw err;
+  }
+
+  await fs.rename(oldPath, newPath);
+  app.addRecentDocument(newPath);
+  return newPath;
+});
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
