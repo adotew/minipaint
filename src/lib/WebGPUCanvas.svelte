@@ -7,7 +7,6 @@
   import {
     DEFAULT_CANVAS_HEIGHT,
     DEFAULT_CANVAS_WIDTH,
-    FLOATS_PER_STAMP,
     MAX_CANVAS_SIZE,
     MAX_STAMPS_PER_FRAME,
     MAX_ZOOM,
@@ -27,20 +26,8 @@
     type LayerListItem,
     type PaintLayer,
   } from "./document/layers";
-  import {
-    createEyedropperReadBuffer,
-    createStampBuffer,
-    createStampUniformBuffer,
-    createViewUniformBuffer,
-  } from "./gpu/buffers";
-  import { createBrushStampTexture, loadBrushStampBitmap } from "./gpu/brushStamp";
   import { createCompositeTextureResources } from "./gpu/compositeResources";
   import { createPaintLayerResource, destroyPaintLayerResource } from "./gpu/layerResources";
-  import {
-    createCompositePipelineResources,
-    createStampPipelineResources,
-    createViewportPipelineResources,
-  } from "./gpu/pipelines";
   import { premultipliedRgbaToHex, readTexturePixel } from "./gpu/readback";
   import {
     blitCompositeToViewport as renderCompositeToViewport,
@@ -48,9 +35,9 @@
     renderStamps,
     writeViewUniforms as writeGpuViewUniforms,
   } from "./gpu/rendering";
+  import { initializeGpuCanvas } from "./gpu/rendererSetup";
   import {
     copyTexture,
-    createDocumentTexture,
     readTexturePixels,
     restoreTexture,
     uploadTexturePixels,
@@ -869,113 +856,42 @@
     let cancelled = false;
 
     async function init() {
-      if (!navigator.gpu) {
-        error = "WebGPU is not available in this browser.";
-        return;
-      }
-
-      const adapter = await navigator.gpu.requestAdapter();
-      if (!adapter) {
-        error = "Could not get a WebGPU adapter.";
-        return;
-      }
-
-      const dev = await adapter.requestDevice();
-      if (cancelled) {
-        dev.destroy();
-        return;
-      }
-
-      const ctx = canvas!.getContext("webgpu");
-      if (!ctx) {
-        error = "Could not get a WebGPU canvas context.";
-        return;
-      }
-
-      const format = navigator.gpu.getPreferredCanvasFormat();
-      ctx.configure({ device: dev, format, alphaMode: "premultiplied" });
-
-      const compositeTex = createDocumentTexture(dev, documentWidth, documentHeight, "Composite texture");
-      const compositeView = compositeTex.createView();
-
-      const brushBitmap = await loadBrushStampBitmap(brushStampUrl);
-      if (cancelled) {
-        brushBitmap.close?.();
-        compositeTex.destroy();
-        dev.destroy();
-        return;
-      }
-
-      const brushTex = createBrushStampTexture(dev, brushBitmap);
-      brushBitmap.close?.();
-
-      const paintSamp = dev.createSampler({
-        magFilter: "nearest",
-        minFilter: "nearest",
+      const resources = await initializeGpuCanvas({
+        canvas,
+        documentWidth,
+        documentHeight,
+        brushStampUrl,
+        isCancelled: () => cancelled,
       });
-      const brushSampler = dev.createSampler({
-        magFilter: "linear",
-        minFilter: "linear",
-      });
-      const layerSampler = dev.createSampler({
-        magFilter: "nearest",
-        minFilter: "nearest",
-      });
+      if (!resources) return;
 
-      const brushBuf = createStampBuffer(dev);
+      compositeBindGroupLayout = resources.compositeBindGroupLayout;
+      compositeSampler = resources.compositeSampler;
 
-      // Pre-allocate CPU-side view for filling stamp data
-      stampDataView = new Float32Array(FLOATS_PER_STAMP * MAX_STAMPS_PER_FRAME);
-
-      const stampUbo = createStampUniformBuffer(dev, documentWidth, documentHeight);
-      const viewUbo = createViewUniformBuffer(dev);
-      const eyedropperBuf = createEyedropperReadBuffer(dev);
-
-      const stampResources = createStampPipelineResources(
-        dev,
-        brushSampler,
-        brushTex.createView(),
-        brushBuf,
-        stampUbo,
-      );
-      const compositeResources = createCompositePipelineResources(dev);
-      const viewportResources = createViewportPipelineResources(
-        dev,
-        format,
-        paintSamp,
-        compositeView,
-        viewUbo,
-      );
-
-      compositeBindGroupLayout = compositeResources.bindGroupLayout;
-      compositeSampler = layerSampler;
-
-      const initialLayer = createPaintLayer(dev, { name: "Layer 1" });
       nextLayerNumber = 2;
-      layers = [initialLayer];
-      activeLayerId = initialLayer.id;
+      layers = [resources.initialLayer];
+      activeLayerId = resources.initialLayer.id;
       syncLayerList();
       markCompositeDirty();
 
-      // Store refs
-      device = dev;
-      context = ctx;
-      compositeTexture = compositeTex;
-      compositeTextureView = compositeView;
-      brushStampTexture = brushTex;
-      stampBuffer = brushBuf;
-      stampUniformBuffer = stampUbo;
-      viewUniformBuffer = viewUbo;
-      eyedropperReadBuffer = eyedropperBuf;
-      stampPipeline = stampResources.pipeline;
-      compositePipeline = compositeResources.pipeline;
-      renderPipeline = viewportResources.pipeline;
-      stampBindGroup = stampResources.bindGroup;
-      renderBindGroup = viewportResources.bindGroup;
-      renderBindGroupLayout = viewportResources.bindGroupLayout;
-      paintSampler = paintSamp;
+      device = resources.device;
+      context = resources.context;
+      compositeTexture = resources.compositeTexture;
+      compositeTextureView = resources.compositeTextureView;
+      brushStampTexture = resources.brushStampTexture;
+      stampBuffer = resources.stampBuffer;
+      stampUniformBuffer = resources.stampUniformBuffer;
+      viewUniformBuffer = resources.viewUniformBuffer;
+      eyedropperReadBuffer = resources.eyedropperReadBuffer;
+      stampPipeline = resources.stampPipeline;
+      compositePipeline = resources.compositePipeline;
+      renderPipeline = resources.renderPipeline;
+      stampBindGroup = resources.stampBindGroup;
+      renderBindGroup = resources.renderBindGroup;
+      renderBindGroupLayout = resources.renderBindGroupLayout;
+      paintSampler = resources.paintSampler;
+      stampDataView = resources.stampDataView;
 
-      // Initial present
       if (canvasWidth > 0 && canvasHeight > 0) {
         scheduleFrame();
       }
@@ -983,7 +899,7 @@
 
     init().catch((e) => {
       console.error(e);
-      error = "Failed to initialize WebGPU.";
+      error = e instanceof Error ? e.message : "Failed to initialize WebGPU.";
     });
 
     return () => {
