@@ -25,6 +25,7 @@
     type LayerListItem,
     type PaintLayer,
   } from "./document/layers";
+  import { StrokeHistoryManager } from "./document/strokeHistory";
   import { GpuPaintRenderer } from "./gpu/paintRenderer";
   import { initializeGpuCanvas } from "./gpu/rendererSetup";
   import {
@@ -104,14 +105,12 @@
 
   // ---- undo / redo state ----
   let history = new HistoryManager();
-  let shouldSaveHistoryAfterFrame = false;
+  let strokeHistory = new StrokeHistoryManager();
 
   // ---- drawing state ----
   let isDrawing = false;
   let strokeUsesPressure = false;
   let lastPoint = { x: 0, y: 0, radius: 0, opacity: 1 };
-  let currentStrokeHistory: { layerId: LayerId; before: GPUTexture } | null = null;
-  let strokeHadPaint = false;
 
   // ---- brush resize state ----
   let isResizingBrush = false;
@@ -212,15 +211,12 @@
   function flushPendingWorkForExport() {
     syncRendererViewState();
     renderer?.flushPendingWork();
-    if (shouldSaveHistoryAfterFrame) finalizePendingPaintHistory();
+    if (strokeHistory.shouldSaveAfterFrame) finalizePendingPaintHistory();
   }
 
   function clearHistory() {
     history.clear();
-    currentStrokeHistory?.before.destroy();
-    currentStrokeHistory = null;
-    shouldSaveHistoryAfterFrame = false;
-    strokeHadPaint = false;
+    strokeHistory.clear();
   }
 
   function replaceLayers(nextLayers: PaintLayer[], nextActiveLayerId: LayerId | null) {
@@ -241,22 +237,7 @@
   }
 
   function finalizePendingPaintHistory() {
-    if (!shouldSaveHistoryAfterFrame) return;
-
-    if (currentStrokeHistory && strokeHadPaint) {
-      history.push({
-        kind: "paint",
-        layerId: currentStrokeHistory.layerId,
-        before: currentStrokeHistory.before,
-        redo: null,
-      });
-    } else {
-      currentStrokeHistory?.before.destroy();
-    }
-
-    currentStrokeHistory = null;
-    strokeHadPaint = false;
-    shouldSaveHistoryAfterFrame = false;
+    strokeHistory.finalize(history);
   }
 
   function resetInteractionState() {
@@ -589,7 +570,7 @@
     const queued = renderer?.queueStamp(x, y, radius, rgba) ?? false;
     if (!queued) return false;
 
-    if (isDrawing) strokeHadPaint = true;
+    if (isDrawing) strokeHistory.markPainted();
     return true;
   }
 
@@ -608,7 +589,7 @@
     const queued = renderer?.stampLine({ x1, y1, r1, o1, x2, y2, r2, o2, rgba }) ?? false;
     if (!queued) return;
 
-    if (isDrawing) strokeHadPaint = true;
+    if (isDrawing) strokeHistory.markPainted();
   }
 
   // ====================================================================
@@ -635,7 +616,7 @@
         getLayers: () => layers,
         getActiveLayer,
         onPaintRendered: () => {
-          strokeHadPaint = true;
+          strokeHistory.markPainted();
         },
         onFrameComplete: finalizePendingPaintHistory,
       });
@@ -667,8 +648,7 @@
       }
       renderer?.dispose();
       history.clear();
-      currentStrokeHistory?.before.destroy();
-      currentStrokeHistory = null;
+      strokeHistory.clear();
       renderer = null;
       layers = [];
       layerList = [];
@@ -855,12 +835,10 @@
 
       isDrawing = true;
       strokeUsesPressure = hasRealPressure(e);
-      currentStrokeHistory?.before.destroy();
-      currentStrokeHistory = {
-        layerId: activeLayer.id,
-        before: renderer.copyTexture(activeLayer.texture, "Paint stroke before snapshot"),
-      };
-      strokeHadPaint = false;
+      strokeHistory.begin(
+        activeLayer.id,
+        renderer.copyTexture(activeLayer.texture, "Paint stroke before snapshot"),
+      );
 
       const rect = canvas.getBoundingClientRect();
       const screenX = e.clientX - rect.left;
@@ -943,7 +921,7 @@
     updateBrushPreview(e);
 
     if (wasDrawing) {
-      shouldSaveHistoryAfterFrame = true;
+      strokeHistory.requestSaveAfterFrame();
       scheduleFrame();
     }
 
@@ -973,7 +951,7 @@
     brushPreviewVisible = false;
 
     if (wasDrawing) {
-      shouldSaveHistoryAfterFrame = true;
+      strokeHistory.requestSaveAfterFrame();
       scheduleFrame();
     }
   }
