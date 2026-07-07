@@ -2,10 +2,42 @@
   /// <reference types="@webgpu/types" />
 
   import LayerPanel, { type LayerListItem } from "./LayerPanel.svelte";
-  import { createZipBlob, readZipEntries, type ZipEntry } from "./projectZip";
-  import stampShaderCode from "./shaders/stamp.wgsl?raw";
-  import blitShaderCode from "./shaders/blit.wgsl?raw";
-  import compositeShaderCode from "./shaders/composite.wgsl?raw";
+  import {
+    COPY_BYTES_PER_ROW_ALIGNMENT,
+    DEFAULT_CANVAS_HEIGHT,
+    DEFAULT_CANVAS_WIDTH,
+    FLOATS_PER_STAMP,
+    MAX_CANVAS_SIZE,
+    MAX_HISTORY_DEPTH,
+    MAX_STAMPS_PER_FRAME,
+    MAX_ZOOM,
+    MIN_CANVAS_SIZE,
+    MIN_PRESSURE_OPACITY,
+    MIN_PRESSURE_SIZE,
+    MIN_ZOOM,
+    PRESSURE_EPSILON,
+    PRESSURE_FALLBACK,
+    PRESSURE_OPACITY_GAMMA,
+  } from "./core/constants";
+  import { hexToVec4, withAlpha, type Rgba } from "./core/color";
+  import { getStampBounds, getStampHalfSize, getStampSpacing } from "./core/geometry";
+  import { clamp, lerp } from "./core/math";
+  import type { LayerId, LayerMetadata } from "./core/types";
+  import {
+    createCompositePipelineResources,
+    createStampPipelineResources,
+    createViewportPipelineResources,
+  } from "./gpu/pipelines";
+  import {
+    clearTexture,
+    copyTexture,
+    createDocumentTexture,
+    readTexturePixels,
+    restoreTexture,
+    uploadTexturePixels,
+  } from "./gpu/textures";
+  import { createProjectBlob, decodeProjectBlob } from "./persistence/projectIO";
+  import { pixelsToPngBlob } from "./persistence/png";
   import brushStampUrl from "../assets/charcoal-removebg-preview.png";
   import brushStampOutlineUrl from "../assets/charcoal-removebg-preview.png";
 
@@ -16,8 +48,6 @@
 
   let { color = $bindable(), brushSize = $bindable() }: Props = $props();
 
-  type LayerId = string;
-
   type PaintLayer = {
     id: LayerId;
     name: string;
@@ -26,39 +56,6 @@
     compositeBindGroup: GPUBindGroup;
     visible: boolean;
     locked: boolean;
-  };
-
-  type LayerMetadata = {
-    id: LayerId;
-    name: string;
-    visible: boolean;
-    locked: boolean;
-  };
-
-  type ProjectLayerManifest = LayerMetadata & {
-    image: string;
-  };
-
-  type ProjectManifest = {
-    format: "minipaint-project";
-    version: 1;
-    canvas: {
-      width: number;
-      height: number;
-      background: "#ffffff";
-      colorSpace: "srgb";
-    };
-    activeLayerId: LayerId | null;
-    view: {
-      zoom: number;
-      offsetX: number;
-      offsetY: number;
-    };
-    brush: {
-      color: string;
-      size: number;
-    };
-    layers: ProjectLayerManifest[];
   };
 
   type PaintHistoryEntry = {
@@ -108,26 +105,6 @@
     | LayerAddHistoryEntry
     | LayerDeleteHistoryEntry
     | LayerReorderHistoryEntry;
-
-  const DEFAULT_CANVAS_WIDTH = 4000;
-  const DEFAULT_CANVAS_HEIGHT = 4000;
-  const MIN_CANVAS_SIZE = 64;
-  const MAX_CANVAS_SIZE = 8000;
-  const MIN_ZOOM = 0.01;
-  const MAX_ZOOM = 32;
-  const MAX_STAMPS_PER_FRAME = 1024;
-  const FLOATS_PER_STAMP = 12;
-  const MIN_PRESSURE_SIZE = 0.45;
-  const MIN_PRESSURE_OPACITY = 0.08;
-  const PRESSURE_OPACITY_GAMMA = 1.35;
-  const STAMP_SPACING_RATIO = 0.25;
-  const MIN_STAMP_SPACING = 1;
-  const BRUSH_STAMP_ASPECT = 500 / 500;
-  const PRESSURE_FALLBACK = 0.5;
-  const PRESSURE_EPSILON = 0.001;
-  const MAX_HISTORY_DEPTH = 10;
-  const BYTES_PER_PIXEL = 4;
-  const COPY_BYTES_PER_ROW_ALIGNMENT = 256;
 
   // ---- DOM binding ----
   let canvasEl: HTMLCanvasElement | undefined = $state();
@@ -230,7 +207,7 @@
     x: number;
     y: number;
     radius: number;
-    rgba: [number, number, number, number];
+    rgba: Rgba;
   };
   let pendingStamps: PendingStamp[] = [];
   let rafId: number | null = null;
@@ -245,31 +222,6 @@
   // ====================================================================
   //  Helpers
   // ====================================================================
-
-  function hexToVec4(hex: string): [number, number, number, number] {
-    const clean = hex.replace("#", "");
-    if (clean.length !== 6) return [0, 0, 0, 1];
-    const r = parseInt(clean.substring(0, 2), 16) / 255;
-    const g = parseInt(clean.substring(2, 4), 16) / 255;
-    const b = parseInt(clean.substring(4, 6), 16) / 255;
-    return [r, g, b, 1];
-  }
-
-  function withAlpha(rgba: [number, number, number, number], alpha: number): [number, number, number, number] {
-    return [rgba[0], rgba[1], rgba[2], alpha];
-  }
-
-  function lerp(a: number, b: number, t: number) {
-    return a + (b - a) * t;
-  }
-
-  function clamp(n: number, min: number, max: number) {
-    return Math.max(min, Math.min(max, n));
-  }
-
-  function alignTo(n: number, alignment: number) {
-    return Math.ceil(n / alignment) * alignment;
-  }
 
   function makeExportFilename() {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -287,190 +239,18 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  function canvasToPngBlob(canvas: HTMLCanvasElement) {
-    return new Promise<Blob>((resolve, reject) => {
-      canvas.toBlob((blob) => {
-        if (blob) {
-          resolve(blob);
-        } else {
-          reject(new Error("Failed to encode PNG."));
-        }
-      }, "image/png");
-    });
-  }
-
-  async function readTexturePixels(dev: GPUDevice, texture: GPUTexture) {
-    const bytesPerRow = documentWidth * BYTES_PER_PIXEL;
-    const paddedBytesPerRow = alignTo(bytesPerRow, COPY_BYTES_PER_ROW_ALIGNMENT);
-    const bufferSize = paddedBytesPerRow * documentHeight;
-    const readBuffer = dev.createBuffer({
-      size: bufferSize,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-
-    const encoder = dev.createCommandEncoder();
-    encoder.copyTextureToBuffer(
-      { texture },
-      {
-        buffer: readBuffer,
-        bytesPerRow: paddedBytesPerRow,
-        rowsPerImage: documentHeight,
-      },
-      [documentWidth, documentHeight, 1],
-    );
-    dev.queue.submit([encoder.finish()]);
-
-    let isMapped = false;
-    try {
-      await readBuffer.mapAsync(GPUMapMode.READ);
-      isMapped = true;
-
-      const mapped = readBuffer.getMappedRange();
-      const source = new Uint8Array(mapped);
-      const pixels = new Uint8ClampedArray(documentWidth * documentHeight * BYTES_PER_PIXEL);
-
-      for (let y = 0; y < documentHeight; y++) {
-        const sourceOffset = y * paddedBytesPerRow;
-        const targetOffset = y * bytesPerRow;
-        pixels.set(source.subarray(sourceOffset, sourceOffset + bytesPerRow), targetOffset);
-      }
-
-      return pixels;
-    } finally {
-      if (isMapped) readBuffer.unmap();
-      readBuffer.destroy();
-    }
-  }
-
-  async function pixelsToPngBlob(pixels: Uint8ClampedArray) {
-    const exportCanvas = document.createElement("canvas");
-    exportCanvas.width = documentWidth;
-    exportCanvas.height = documentHeight;
-
-    const ctx = exportCanvas.getContext("2d");
-    if (!ctx) throw new Error("Could not create PNG export canvas.");
-
-    ctx.putImageData(new ImageData(pixels, documentWidth, documentHeight), 0, 0);
-    return await canvasToPngBlob(exportCanvas);
-  }
-
   async function readTextureAsPngBlob(dev: GPUDevice, texture: GPUTexture) {
-    return await pixelsToPngBlob(await readTexturePixels(dev, texture));
-  }
-
-  function unpremultiplyPixels(pixels: Uint8ClampedArray) {
-    for (let i = 0; i < pixels.length; i += BYTES_PER_PIXEL) {
-      const alpha = pixels[i + 3];
-      if (alpha === 0) {
-        pixels[i] = 0;
-        pixels[i + 1] = 0;
-        pixels[i + 2] = 0;
-        continue;
-      }
-
-      pixels[i] = Math.min(255, Math.round(pixels[i] * 255 / alpha));
-      pixels[i + 1] = Math.min(255, Math.round(pixels[i + 1] * 255 / alpha));
-      pixels[i + 2] = Math.min(255, Math.round(pixels[i + 2] * 255 / alpha));
-    }
-  }
-
-  function premultiplyPixels(pixels: Uint8ClampedArray) {
-    for (let i = 0; i < pixels.length; i += BYTES_PER_PIXEL) {
-      const alpha = pixels[i + 3];
-      pixels[i] = Math.round(pixels[i] * alpha / 255);
-      pixels[i + 1] = Math.round(pixels[i + 1] * alpha / 255);
-      pixels[i + 2] = Math.round(pixels[i + 2] * alpha / 255);
-    }
-  }
-
-  async function pngBlobToPixels(blob: Blob, width = documentWidth, height = documentHeight) {
-    const bitmap = await createImageBitmap(blob);
-    try {
-      if (bitmap.width !== width || bitmap.height !== height) {
-        throw new Error(`Layer image has unsupported size ${bitmap.width} × ${bitmap.height}.`);
-      }
-
-      const decodeCanvas = document.createElement("canvas");
-      decodeCanvas.width = width;
-      decodeCanvas.height = height;
-      const ctx = decodeCanvas.getContext("2d");
-      if (!ctx) throw new Error("Could not create PNG decode canvas.");
-
-      ctx.clearRect(0, 0, width, height);
-      ctx.drawImage(bitmap, 0, 0);
-      return ctx.getImageData(0, 0, width, height).data;
-    } finally {
-      bitmap.close?.();
-    }
-  }
-
-  function uploadTexturePixels(dev: GPUDevice, texture: GPUTexture, pixels: Uint8ClampedArray) {
-    const bytesPerRow = documentWidth * BYTES_PER_PIXEL;
-    const paddedBytesPerRow = alignTo(bytesPerRow, COPY_BYTES_PER_ROW_ALIGNMENT);
-    const padded = new Uint8Array(paddedBytesPerRow * documentHeight);
-
-    for (let y = 0; y < documentHeight; y++) {
-      const sourceOffset = y * bytesPerRow;
-      const targetOffset = y * paddedBytesPerRow;
-      padded.set(pixels.subarray(sourceOffset, sourceOffset + bytesPerRow), targetOffset);
-    }
-
-    dev.queue.writeTexture(
-      { texture },
-      padded,
-      {
-        bytesPerRow: paddedBytesPerRow,
-        rowsPerImage: documentHeight,
-      },
-      [documentWidth, documentHeight, 1],
+    return await pixelsToPngBlob(
+      await readTexturePixels(dev, texture, documentWidth, documentHeight),
+      documentWidth,
+      documentHeight,
     );
-  }
-
-  function bytesToBlob(bytes: Uint8Array, type: string) {
-    const copy = new Uint8Array(bytes.byteLength);
-    copy.set(bytes);
-    return new Blob([copy], { type });
-  }
-
-  function blobToBytes(blob: Blob) {
-    return blob.arrayBuffer().then((buffer) => new Uint8Array(buffer));
   }
 
   function screenToCanvas(screenX: number, screenY: number) {
     return {
       x: screenX / zoom + offsetX,
       y: screenY / zoom + offsetY,
-    };
-  }
-
-  function getStampHalfSize(radius: number) {
-    if (BRUSH_STAMP_ASPECT >= 1) {
-      return { halfWidth: radius, halfHeight: radius / BRUSH_STAMP_ASPECT };
-    }
-
-    return { halfWidth: radius * BRUSH_STAMP_ASPECT, halfHeight: radius };
-  }
-
-  function getStampSpacing(radius: number) {
-    return Math.max(MIN_STAMP_SPACING, radius * STAMP_SPACING_RATIO);
-  }
-
-  function getStampBounds(x: number, y: number, radius: number) {
-    const { halfWidth, halfHeight } = getStampHalfSize(radius);
-    const minX = Math.max(0, Math.floor(x - halfWidth));
-    const maxX = Math.min(documentWidth - 1, Math.ceil(x + halfWidth));
-    const minY = Math.max(0, Math.floor(y - halfHeight));
-    const maxY = Math.min(documentHeight - 1, Math.ceil(y + halfHeight));
-
-    return {
-      minX,
-      maxX,
-      minY,
-      maxY,
-      width: maxX - minX + 1,
-      height: maxY - minY + 1,
-      halfWidth,
-      halfHeight,
     };
   }
 
@@ -484,42 +264,13 @@
   //  WebGPU helpers
   // ====================================================================
 
-  function createDocumentTexture(dev: GPUDevice, label: string) {
-    return dev.createTexture({
-      label,
-      size: [documentWidth, documentHeight],
-      format: "rgba8unorm",
-      usage:
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.RENDER_ATTACHMENT |
-        GPUTextureUsage.COPY_SRC |
-        GPUTextureUsage.COPY_DST,
-    });
-  }
-
-  function clearTexture(dev: GPUDevice, tex: GPUTexture, colorValue: GPUColor) {
-    const encoder = dev.createCommandEncoder();
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: tex.createView(),
-          loadOp: "clear",
-          clearValue: colorValue,
-          storeOp: "store",
-        },
-      ],
-    });
-    pass.end();
-    dev.queue.submit([encoder.finish()]);
-  }
-
   function recreateCompositeResources(dev: GPUDevice) {
     if (!renderBindGroupLayout || !paintSampler || !viewUniformBuffer) {
       throw new Error("Viewport rendering is not ready.");
     }
 
     const oldCompositeTexture = compositeTexture;
-    const texture = createDocumentTexture(dev, "Composite texture");
+    const texture = createDocumentTexture(dev, documentWidth, documentHeight, "Composite texture");
     const view = texture.createView();
     const bindGroup = dev.createBindGroup({
       layout: renderBindGroupLayout,
@@ -535,28 +286,6 @@
     renderBindGroup = bindGroup;
     oldCompositeTexture?.destroy();
     markCompositeDirty();
-  }
-
-  function copyTexture(dev: GPUDevice, source: GPUTexture, label: string) {
-    const snapshot = createDocumentTexture(dev, label);
-    const encoder = dev.createCommandEncoder();
-    encoder.copyTextureToTexture(
-      { texture: source },
-      { texture: snapshot },
-      [documentWidth, documentHeight],
-    );
-    dev.queue.submit([encoder.finish()]);
-    return snapshot;
-  }
-
-  function restoreTexture(dev: GPUDevice, target: GPUTexture, snapshot: GPUTexture) {
-    const encoder = dev.createCommandEncoder();
-    encoder.copyTextureToTexture(
-      { texture: snapshot },
-      { texture: target },
-      [documentWidth, documentHeight],
-    );
-    dev.queue.submit([encoder.finish()]);
   }
 
   function makeLayerId(): LayerId {
@@ -592,7 +321,7 @@
     }
 
     const layerId = metadata?.id ?? makeLayerId();
-    const texture = createDocumentTexture(dev, `Paint layer ${layerId}`);
+    const texture = createDocumentTexture(dev, documentWidth, documentHeight, `Paint layer ${layerId}`);
     const view = texture.createView();
     const compositeBindGroup = dev.createBindGroup({
       layout: compositeBindGroupLayout,
@@ -613,7 +342,7 @@
     };
 
     if (sourcePixels) {
-      restoreTexture(dev, texture, sourcePixels);
+      restoreTexture(dev, texture, sourcePixels, documentWidth, documentHeight);
     } else {
       clearTexture(dev, texture, [0, 0, 0, 0]);
     }
@@ -662,92 +391,6 @@
       : layers[layers.length - 1]?.id ?? null;
     syncLayerList();
     markCompositeDirty();
-  }
-
-  function asRecord(value: unknown, label: string): Record<string, unknown> {
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new Error(`Invalid project file: ${label} must be an object.`);
-    }
-    return value as Record<string, unknown>;
-  }
-
-  function asString(value: unknown, label: string) {
-    if (typeof value !== "string") throw new Error(`Invalid project file: ${label} must be a string.`);
-    return value;
-  }
-
-  function asNumber(value: unknown, label: string) {
-    if (typeof value !== "number" || !Number.isFinite(value)) {
-      throw new Error(`Invalid project file: ${label} must be a number.`);
-    }
-    return value;
-  }
-
-  function asBoolean(value: unknown, label: string) {
-    if (typeof value !== "boolean") throw new Error(`Invalid project file: ${label} must be a boolean.`);
-    return value;
-  }
-
-  function parseProjectManifest(value: unknown): ProjectManifest {
-    const root = asRecord(value, "manifest");
-    if (root.format !== "minipaint-project") throw new Error("Unsupported project file format.");
-    if (root.version !== 1) throw new Error("Unsupported project file version.");
-
-    const canvas = asRecord(root.canvas, "canvas");
-    const width = asNumber(canvas.width, "canvas.width");
-    const height = asNumber(canvas.height, "canvas.height");
-    if (
-      width < MIN_CANVAS_SIZE ||
-      height < MIN_CANVAS_SIZE ||
-      width > MAX_CANVAS_SIZE ||
-      height > MAX_CANVAS_SIZE
-    ) {
-      throw new Error(`Unsupported canvas size ${width} × ${height}.`);
-    }
-
-    const view = asRecord(root.view, "view");
-    const brush = asRecord(root.brush, "brush");
-    const rawLayers = root.layers;
-    if (!Array.isArray(rawLayers) || rawLayers.length === 0) {
-      throw new Error("Invalid project file: at least one layer is required.");
-    }
-
-    const layersManifest = rawLayers.map((rawLayer, index): ProjectLayerManifest => {
-      const layer = asRecord(rawLayer, `layers[${index}]`);
-      return {
-        id: asString(layer.id, `layers[${index}].id`),
-        name: asString(layer.name, `layers[${index}].name`),
-        image: asString(layer.image, `layers[${index}].image`),
-        visible: asBoolean(layer.visible, `layers[${index}].visible`),
-        locked: asBoolean(layer.locked, `layers[${index}].locked`),
-      };
-    });
-
-    const activeLayerId = root.activeLayerId === null
-      ? null
-      : asString(root.activeLayerId, "activeLayerId");
-
-    return {
-      format: "minipaint-project",
-      version: 1,
-      canvas: {
-        width,
-        height,
-        background: "#ffffff",
-        colorSpace: "srgb",
-      },
-      activeLayerId,
-      view: {
-        zoom: asNumber(view.zoom, "view.zoom"),
-        offsetX: asNumber(view.offsetX, "view.offsetX"),
-        offsetY: asNumber(view.offsetY, "view.offsetY"),
-      },
-      brush: {
-        color: asString(brush.color, "brush.color"),
-        size: asNumber(brush.size, "brush.size"),
-      },
-      layers: layersManifest,
-    };
   }
 
   function updateNextLayerNumber() {
@@ -841,8 +484,8 @@
       const layer = layers.find((item) => item.id === entry.layerId);
       if (!layer) return;
       entry.redo?.destroy();
-      entry.redo = copyTexture(device, layer.texture, "Paint redo snapshot");
-      restoreTexture(device, layer.texture, entry.before);
+      entry.redo = copyTexture(device, layer.texture, documentWidth, documentHeight, "Paint redo snapshot");
+      restoreTexture(device, layer.texture, entry.before, documentWidth, documentHeight);
       activeLayerId = entry.layerId;
     } else if (entry.kind === "layer-metadata") {
       const layer = layers.find((item) => item.id === entry.layerId);
@@ -869,7 +512,7 @@
     if (entry.kind === "paint") {
       const layer = layers.find((item) => item.id === entry.layerId);
       if (!layer || !entry.redo) return;
-      restoreTexture(device, layer.texture, entry.redo);
+      restoreTexture(device, layer.texture, entry.redo, documentWidth, documentHeight);
       activeLayerId = entry.layerId;
     } else if (entry.kind === "layer-metadata") {
       const layer = layers.find((item) => item.id === entry.layerId);
@@ -940,7 +583,7 @@
 
     const activeBefore = activeLayerId;
     const [layer] = layers.splice(index, 1);
-    const pixels = copyTexture(device, layer.texture, "Deleted layer snapshot");
+    const pixels = copyTexture(device, layer.texture, documentWidth, documentHeight, "Deleted layer snapshot");
     const metadata = captureLayerMetadata(layer);
     const activeAfter = activeBefore === metadata.id
       ? layers[Math.min(index, layers.length - 1)]?.id ?? null
@@ -1087,34 +730,9 @@
 
     flushPendingWorkForExport();
 
-    const entries: ZipEntry[] = [];
-    const projectLayers: ProjectLayerManifest[] = [];
-
-    for (let i = 0; i < layers.length; i++) {
-      const layer = layers[i];
-      const image = `layers/${String(i).padStart(3, "0")}-${layer.id.replace(/[^a-zA-Z0-9_-]/g, "_")}.png`;
-      const pixels = await readTexturePixels(device, layer.texture);
-      unpremultiplyPixels(pixels);
-      const png = await pixelsToPngBlob(pixels);
-      entries.push({ path: image, data: await blobToBytes(png) });
-      projectLayers.push({
-        id: layer.id,
-        name: layer.name,
-        image,
-        visible: layer.visible,
-        locked: layer.locked,
-      });
-    }
-
-    const manifest: ProjectManifest = {
-      format: "minipaint-project",
-      version: 1,
-      canvas: {
-        width: documentWidth,
-        height: documentHeight,
-        background: "#ffffff",
-        colorSpace: "srgb",
-      },
+    return await createProjectBlob({
+      width: documentWidth,
+      height: documentHeight,
       activeLayerId,
       view: {
         zoom,
@@ -1125,15 +743,16 @@
         color,
         size: brushSize,
       },
-      layers: projectLayers,
-    };
-
-    entries.unshift({
-      path: "manifest.json",
-      data: new TextEncoder().encode(JSON.stringify(manifest, null, 2)),
+      layers: await Promise.all(
+        layers.map(async (layer) => ({
+          id: layer.id,
+          name: layer.name,
+          visible: layer.visible,
+          locked: layer.locked,
+          pixels: await readTexturePixels(device, layer.texture, documentWidth, documentHeight),
+        })),
+      ),
     });
-
-    return createZipBlob(entries);
   }
 
   export async function loadProject(blob: Blob) {
@@ -1143,26 +762,7 @@
     resetInteractionState();
     pendingStamps = [];
 
-    const entries = await readZipEntries(blob);
-    const manifestBytes = entries.get("manifest.json");
-    if (!manifestBytes) throw new Error("Invalid project file: manifest.json is missing.");
-
-    const manifest = parseProjectManifest(JSON.parse(new TextDecoder().decode(manifestBytes)));
-    const decodedLayers: { metadata: ProjectLayerManifest; pixels: Uint8ClampedArray }[] = [];
-
-    for (const layerManifest of manifest.layers) {
-      const imageBytes = entries.get(layerManifest.image);
-      if (!imageBytes) throw new Error(`Invalid project file: ${layerManifest.image} is missing.`);
-
-      const pixels = await pngBlobToPixels(
-        bytesToBlob(imageBytes, "image/png"),
-        manifest.canvas.width,
-        manifest.canvas.height,
-      );
-      premultiplyPixels(pixels);
-      decodedLayers.push({ metadata: layerManifest, pixels });
-    }
-
+    const { manifest, layers: decodedLayers } = await decodeProjectBlob(blob);
     const loadedLayers: PaintLayer[] = [];
     resetInteractionState();
     pendingStamps = [];
@@ -1175,7 +775,7 @@
     try {
       for (const decodedLayer of decodedLayers) {
         const layer = createPaintLayer(device, decodedLayer.metadata);
-        uploadTexturePixels(device, layer.texture, decodedLayer.pixels);
+        uploadTexturePixels(device, layer.texture, decodedLayer.pixels, documentWidth, documentHeight);
         loadedLayers.push(layer);
       }
     } catch (e) {
@@ -1247,7 +847,13 @@
   function writeStampData(stamps: PendingStamp[], count: number) {
     for (let i = 0; i < count; i++) {
       const stamp = stamps[i];
-      const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(stamp.x, stamp.y, stamp.radius);
+      const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(
+        stamp.x,
+        stamp.y,
+        stamp.radius,
+        documentWidth,
+        documentHeight,
+      );
 
       const offset = i * FLOATS_PER_STAMP;
       stampDataView[offset + 0] = stamp.x;
@@ -1365,9 +971,15 @@
     x: number,
     y: number,
     radius: number,
-    rgba: [number, number, number, number],
+    rgba: Rgba,
   ) {
-    const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(x, y, radius);
+    const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(
+      x,
+      y,
+      radius,
+      documentWidth,
+      documentHeight,
+    );
 
     if (
       x + halfWidth < 0 ||
@@ -1395,7 +1007,7 @@
     y2: number,
     r2: number,
     o2: number,
-    rgba: [number, number, number, number],
+    rgba: Rgba,
   ) {
     const dx = x2 - x1;
     const dy = y2 - y1;
@@ -1466,7 +1078,7 @@
       const format = navigator.gpu.getPreferredCanvasFormat();
       ctx.configure({ device: dev, format, alphaMode: "premultiplied" });
 
-      const compositeTex = createDocumentTexture(dev, "Composite texture");
+      const compositeTex = createDocumentTexture(dev, documentWidth, documentHeight, "Composite texture");
       const compositeView = compositeTex.createView();
 
       const brushBitmap = await loadBrushStampBitmap();
@@ -1534,135 +1146,24 @@
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       });
 
-      // ---- Render pipeline (stamp into active layer texture) ----
-      const stampBindGroupLayout = dev.createBindGroupLayout({
-        entries: [
-          { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
-          { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
-          { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-          { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
-        ],
-      });
+      const stampResources = createStampPipelineResources(
+        dev,
+        brushSampler,
+        brushTex.createView(),
+        brushBuf,
+        stampUbo,
+      );
+      const compositeResources = createCompositePipelineResources(dev);
+      const viewportResources = createViewportPipelineResources(
+        dev,
+        format,
+        paintSamp,
+        compositeView,
+        viewUbo,
+      );
 
-      const stampShaderModule = dev.createShaderModule({ code: stampShaderCode });
-      const stmpPipeline = dev.createRenderPipeline({
-        layout: dev.createPipelineLayout({
-          bindGroupLayouts: [stampBindGroupLayout],
-        }),
-        vertex: {
-          module: stampShaderModule,
-          entryPoint: "vs",
-        },
-        fragment: {
-          module: stampShaderModule,
-          entryPoint: "fs",
-          targets: [
-            {
-              format: "rgba8unorm",
-              blend: {
-                color: {
-                  operation: "add",
-                  srcFactor: "src-alpha",
-                  dstFactor: "one-minus-src-alpha",
-                },
-                alpha: {
-                  operation: "add",
-                  srcFactor: "one",
-                  dstFactor: "one-minus-src-alpha",
-                },
-              },
-            },
-          ],
-        },
-        primitive: { topology: "triangle-list" },
-      });
-
-      const stmpBindGroup = dev.createBindGroup({
-        layout: stampBindGroupLayout,
-        entries: [
-          { binding: 0, resource: brushSampler },
-          { binding: 1, resource: brushTex.createView() },
-          { binding: 2, resource: { buffer: brushBuf } },
-          { binding: 3, resource: { buffer: stampUbo } },
-        ],
-      });
-
-      // ---- Composite pipeline (visible layers into composite texture) ----
-      const compBindGroupLayout = dev.createBindGroupLayout({
-        entries: [
-          { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
-          { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
-        ],
-      });
-
-      const compPipeline = dev.createRenderPipeline({
-        layout: dev.createPipelineLayout({
-          bindGroupLayouts: [compBindGroupLayout],
-        }),
-        vertex: {
-          module: dev.createShaderModule({ code: compositeShaderCode }),
-          entryPoint: "vs",
-        },
-        fragment: {
-          module: dev.createShaderModule({ code: compositeShaderCode }),
-          entryPoint: "fs",
-          targets: [
-            {
-              format: "rgba8unorm",
-              blend: {
-                color: {
-                  operation: "add",
-                  srcFactor: "one",
-                  dstFactor: "one-minus-src-alpha",
-                },
-                alpha: {
-                  operation: "add",
-                  srcFactor: "one",
-                  dstFactor: "one-minus-src-alpha",
-                },
-              },
-            },
-          ],
-        },
-        primitive: { topology: "triangle-list" },
-      });
-
-      compositeBindGroupLayout = compBindGroupLayout;
+      compositeBindGroupLayout = compositeResources.bindGroupLayout;
       compositeSampler = layerSampler;
-
-      // ---- Render pipeline (blit) ----
-      const renderBgLayout = dev.createBindGroupLayout({
-        entries: [
-          { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
-          { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
-          { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-        ],
-      });
-
-      const rndrPipeline = dev.createRenderPipeline({
-        layout: dev.createPipelineLayout({
-          bindGroupLayouts: [renderBgLayout],
-        }),
-        vertex: {
-          module: dev.createShaderModule({ code: blitShaderCode }),
-          entryPoint: "vs",
-        },
-        fragment: {
-          module: dev.createShaderModule({ code: blitShaderCode }),
-          entryPoint: "fs",
-          targets: [{ format }],
-        },
-        primitive: { topology: "triangle-list" },
-      });
-
-      const rndrBindGroup = dev.createBindGroup({
-        layout: renderBgLayout,
-        entries: [
-          { binding: 0, resource: paintSamp },
-          { binding: 1, resource: compositeView },
-          { binding: 2, resource: { buffer: viewUbo } },
-        ],
-      });
 
       const initialLayer = createPaintLayer(dev, { name: "Layer 1" });
       nextLayerNumber = 2;
@@ -1681,12 +1182,12 @@
       stampUniformBuffer = stampUbo;
       viewUniformBuffer = viewUbo;
       eyedropperReadBuffer = eyedropperBuf;
-      stampPipeline = stmpPipeline;
-      compositePipeline = compPipeline;
-      renderPipeline = rndrPipeline;
-      stampBindGroup = stmpBindGroup;
-      renderBindGroup = rndrBindGroup;
-      renderBindGroupLayout = renderBgLayout;
+      stampPipeline = stampResources.pipeline;
+      compositePipeline = compositeResources.pipeline;
+      renderPipeline = viewportResources.pipeline;
+      stampBindGroup = stampResources.bindGroup;
+      renderBindGroup = viewportResources.bindGroup;
+      renderBindGroupLayout = viewportResources.bindGroupLayout;
       paintSampler = paintSamp;
 
       // Initial present
@@ -1960,7 +1461,7 @@
       currentStrokeHistory?.before.destroy();
       currentStrokeHistory = {
         layerId: activeLayer.id,
-        before: copyTexture(device, activeLayer.texture, "Paint stroke before snapshot"),
+        before: copyTexture(device, activeLayer.texture, documentWidth, documentHeight, "Paint stroke before snapshot"),
       };
       strokeHadPaint = false;
 
