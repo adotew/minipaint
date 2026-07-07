@@ -24,10 +24,23 @@
   import { clamp, lerp } from "./core/math";
   import type { LayerId, LayerMetadata } from "./core/types";
   import {
+    createEyedropperReadBuffer,
+    createStampBuffer,
+    createStampUniformBuffer,
+    createViewUniformBuffer,
+  } from "./gpu/buffers";
+  import { createBrushStampTexture, loadBrushStampBitmap } from "./gpu/brushStamp";
+  import {
     createCompositePipelineResources,
     createStampPipelineResources,
     createViewportPipelineResources,
   } from "./gpu/pipelines";
+  import {
+    blitCompositeToViewport as renderCompositeToViewport,
+    rebuildComposite as renderRebuildComposite,
+    renderStamps,
+    writeViewUniforms as writeGpuViewUniforms,
+  } from "./gpu/rendering";
   import {
     clearTexture,
     copyTexture,
@@ -252,12 +265,6 @@
       x: screenX / zoom + offsetX,
       y: screenY / zoom + offsetY,
     };
-  }
-
-  async function loadBrushStampBitmap() {
-    const response = await fetch(brushStampUrl);
-    const blob = await response.blob();
-    return createImageBitmap(blob);
   }
 
   // ====================================================================
@@ -799,76 +806,14 @@
 
   function rebuildComposite(encoder: GPUCommandEncoder) {
     if (!compositeTextureView || !compositePipeline) return;
-
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: compositeTextureView,
-          loadOp: "clear",
-          clearValue: [1, 1, 1, 1],
-          storeOp: "store",
-        },
-      ],
-    });
-
-    pass.setPipeline(compositePipeline);
-    for (const layer of layers) {
-      if (!layer.visible) continue;
-      pass.setBindGroup(0, layer.compositeBindGroup);
-      pass.draw(3);
-    }
-    pass.end();
-
+    renderRebuildComposite(encoder, compositeTextureView, compositePipeline, layers);
     compositeDirty = false;
   }
 
   function blitCompositeToViewport(encoder: GPUCommandEncoder) {
     if (!context || !renderPipeline || !renderBindGroup) return;
-
     writeViewUniforms(device!);
-
-    const textureView = context.getCurrentTexture().createView();
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: textureView,
-          loadOp: "clear",
-          clearValue: [0.5, 0.5, 0.5, 1],
-          storeOp: "store",
-        },
-      ],
-    });
-    renderPass.setPipeline(renderPipeline);
-    renderPass.setBindGroup(0, renderBindGroup);
-    renderPass.draw(3);
-    renderPass.end();
-  }
-
-  function writeStampData(stamps: PendingStamp[], count: number) {
-    for (let i = 0; i < count; i++) {
-      const stamp = stamps[i];
-      const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(
-        stamp.x,
-        stamp.y,
-        stamp.radius,
-        documentWidth,
-        documentHeight,
-      );
-
-      const offset = i * FLOATS_PER_STAMP;
-      stampDataView[offset + 0] = stamp.x;
-      stampDataView[offset + 1] = stamp.y;
-      stampDataView[offset + 2] = halfWidth;
-      stampDataView[offset + 3] = halfHeight;
-      stampDataView[offset + 4] = stamp.rgba[0];
-      stampDataView[offset + 5] = stamp.rgba[1];
-      stampDataView[offset + 6] = stamp.rgba[2];
-      stampDataView[offset + 7] = stamp.rgba[3];
-      stampDataView[offset + 8] = minX;
-      stampDataView[offset + 9] = minY;
-      stampDataView[offset + 10] = maxX;
-      stampDataView[offset + 11] = maxY;
-    }
+    renderCompositeToViewport(encoder, context, renderPipeline, renderBindGroup);
   }
 
   /**
@@ -910,26 +855,20 @@
         pendingStamps = stamps.slice(count).concat(pendingStamps);
       }
 
-      if (activeLayer && activeLayer.visible && !activeLayer.locked) {
-        writeStampData(stamps, count);
-        device.queue.writeBuffer(stampBuffer, 0, stampDataView, 0, count * FLOATS_PER_STAMP);
-
-        const stampPass = encoder.beginRenderPass({
-          colorAttachments: [
-            {
-              view: activeLayer.view,
-              loadOp: "load",
-              storeOp: "store",
-            },
-          ],
-        });
-        stampPass.setPipeline(stampPipeline);
-        stampPass.setBindGroup(0, stampBindGroup);
-        stampPass.draw(6, count);
-        stampPass.end();
-
-        markCompositeDirty();
-      }
+      const rendered = renderStamps({
+        encoder,
+        device,
+        stampBuffer,
+        stampDataView,
+        stamps,
+        count,
+        documentWidth,
+        documentHeight,
+        activeLayer,
+        stampPipeline,
+        stampBindGroup,
+      });
+      if (rendered) markCompositeDirty();
     }
 
     if (compositeDirty) rebuildComposite(encoder);
@@ -947,19 +886,17 @@
   }
 
   function writeViewUniforms(dev: GPUDevice) {
-    const cssWidth = canvasEl?.clientWidth ?? canvasWidth;
-    const cssHeight = canvasEl?.clientHeight ?? canvasHeight;
-
-    const viewUniforms = new Float32Array([
-      cssWidth / (canvasWidth * zoom),
-      cssHeight / (canvasHeight * zoom),
+    writeGpuViewUniforms(dev, viewUniformBuffer!, {
+      cssWidth: canvasEl?.clientWidth ?? canvasWidth,
+      cssHeight: canvasEl?.clientHeight ?? canvasHeight,
+      canvasWidth,
+      canvasHeight,
+      zoom,
       offsetX,
       offsetY,
       documentWidth,
       documentHeight,
-      0, 0, // padding to 32 bytes (16-byte alignment)
-    ]);
-    dev.queue.writeBuffer(viewUniformBuffer!, 0, viewUniforms);
+    });
   }
 
   function scheduleFrame() {
@@ -1081,7 +1018,7 @@
       const compositeTex = createDocumentTexture(dev, documentWidth, documentHeight, "Composite texture");
       const compositeView = compositeTex.createView();
 
-      const brushBitmap = await loadBrushStampBitmap();
+      const brushBitmap = await loadBrushStampBitmap(brushStampUrl);
       if (cancelled) {
         brushBitmap.close?.();
         compositeTex.destroy();
@@ -1089,19 +1026,7 @@
         return;
       }
 
-      const brushTex = dev.createTexture({
-        size: [brushBitmap.width, brushBitmap.height],
-        format: "rgba8unorm",
-        usage:
-          GPUTextureUsage.TEXTURE_BINDING |
-          GPUTextureUsage.COPY_DST |
-          GPUTextureUsage.RENDER_ATTACHMENT,
-      });
-      dev.queue.copyExternalImageToTexture(
-        { source: brushBitmap },
-        { texture: brushTex },
-        [brushBitmap.width, brushBitmap.height],
-      );
+      const brushTex = createBrushStampTexture(dev, brushBitmap);
       brushBitmap.close?.();
 
       const paintSamp = dev.createSampler({
@@ -1117,34 +1042,14 @@
         minFilter: "nearest",
       });
 
-      // Storage buffer for stamp data (12 f32 × MAX_STAMPS_PER_FRAME)
-      const brushBufSize = FLOATS_PER_STAMP * MAX_STAMPS_PER_FRAME * 4; // f32 = 4 bytes
-      const brushBuf = dev.createBuffer({
-        size: brushBufSize,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      });
+      const brushBuf = createStampBuffer(dev);
 
       // Pre-allocate CPU-side view for filling stamp data
       stampDataView = new Float32Array(FLOATS_PER_STAMP * MAX_STAMPS_PER_FRAME);
 
-      // Stamp uniforms (16 bytes; vec2f + padding)
-      const stampUbo = dev.createBuffer({
-        size: 16,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
-      dev.queue.writeBuffer(stampUbo, 0, new Float32Array([documentWidth, documentHeight, 0, 0]));
-
-      // View uniforms (32 bytes)
-      const viewUbo = dev.createBuffer({
-        size: 32,
-        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      });
-
-      // Eyedropper readback buffer (one RGBA pixel, bytesPerRow aligned to 256)
-      const eyedropperBuf = dev.createBuffer({
-        size: COPY_BYTES_PER_ROW_ALIGNMENT,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
+      const stampUbo = createStampUniformBuffer(dev, documentWidth, documentHeight);
+      const viewUbo = createViewUniformBuffer(dev);
+      const eyedropperBuf = createEyedropperReadBuffer(dev);
 
       const stampResources = createStampPipelineResources(
         dev,
