@@ -8,7 +8,6 @@
     DEFAULT_CANVAS_WIDTH,
     FLOATS_PER_STAMP,
     MAX_CANVAS_SIZE,
-    MAX_HISTORY_DEPTH,
     MAX_STAMPS_PER_FRAME,
     MAX_ZOOM,
     MIN_CANVAS_SIZE,
@@ -23,6 +22,7 @@
   import { getStampBounds, getStampHalfSize, getStampSpacing } from "./core/geometry";
   import { clamp, lerp } from "./core/math";
   import type { LayerId, LayerMetadata } from "./core/types";
+  import { HistoryManager, type HistoryEntry, type LayerAddHistoryEntry } from "./document/history";
   import {
     createEyedropperReadBuffer,
     createStampBuffer,
@@ -70,54 +70,6 @@
     visible: boolean;
     locked: boolean;
   };
-
-  type PaintHistoryEntry = {
-    kind: "paint";
-    layerId: LayerId;
-    before: GPUTexture;
-    redo: GPUTexture | null;
-  };
-
-  type LayerMetadataHistoryEntry = {
-    kind: "layer-metadata";
-    layerId: LayerId;
-    before: LayerMetadata;
-    after: LayerMetadata;
-  };
-
-  type LayerAddHistoryEntry = {
-    kind: "layer-add";
-    layerId: LayerId;
-    index: number;
-    metadata: LayerMetadata;
-    activeBefore: LayerId | null;
-    activeAfter: LayerId;
-  };
-
-  type LayerDeleteHistoryEntry = {
-    kind: "layer-delete";
-    layerId: LayerId;
-    index: number;
-    metadata: LayerMetadata;
-    pixels: GPUTexture;
-    activeBefore: LayerId;
-    activeAfter: LayerId | null;
-  };
-
-  type LayerReorderHistoryEntry = {
-    kind: "layer-reorder";
-    beforeOrder: LayerId[];
-    afterOrder: LayerId[];
-    activeBefore: LayerId | null;
-    activeAfter: LayerId | null;
-  };
-
-  type HistoryEntry =
-    | PaintHistoryEntry
-    | LayerMetadataHistoryEntry
-    | LayerAddHistoryEntry
-    | LayerDeleteHistoryEntry
-    | LayerReorderHistoryEntry;
 
   // ---- DOM binding ----
   let canvasEl: HTMLCanvasElement | undefined = $state();
@@ -184,8 +136,7 @@
   let nextLayerNumber = 1;
 
   // ---- undo / redo state ----
-  let historyEntries: HistoryEntry[] = [];
-  let historyIndex = -1;
+  let history = new HistoryManager();
   let shouldSaveHistoryAfterFrame = false;
 
   // ---- drawing state ----
@@ -376,11 +327,7 @@
   }
 
   function clearHistory() {
-    for (const entry of historyEntries) {
-      destroyHistoryEntry(entry);
-    }
-    historyEntries = [];
-    historyIndex = -1;
+    history.clear();
     currentStrokeHistory?.before.destroy();
     currentStrokeHistory = null;
     shouldSaveHistoryAfterFrame = false;
@@ -409,40 +356,12 @@
     nextLayerNumber = Math.max(maxLayerNumber + 1, layers.length + 1);
   }
 
-  function destroyHistoryEntry(entry: HistoryEntry) {
-    if (entry.kind === "paint") {
-      entry.before.destroy();
-      entry.redo?.destroy();
-      return;
-    }
-
-    if (entry.kind === "layer-delete") {
-      entry.pixels.destroy();
-    }
-  }
-
-  function pushHistoryEntry(entry: HistoryEntry) {
-    while (historyEntries.length > historyIndex + 1) {
-      const discarded = historyEntries.pop();
-      if (discarded) destroyHistoryEntry(discarded);
-    }
-
-    historyEntries.push(entry);
-    historyIndex++;
-
-    while (historyEntries.length > MAX_HISTORY_DEPTH) {
-      const discarded = historyEntries.shift();
-      if (discarded) destroyHistoryEntry(discarded);
-      historyIndex--;
-    }
-  }
-
   function finalizePendingPaintHistory() {
     if (!shouldSaveHistoryAfterFrame) return;
 
     if (currentStrokeHistory && strokeHadPaint) {
-      pushHistoryEntry({
-        kind: "paint",
+      history.push({
+        kind: "paint"},{
         layerId: currentStrokeHistory.layerId,
         before: currentStrokeHistory.before,
         redo: null,
@@ -539,24 +458,24 @@
   }
 
   export function undo() {
-    if (!device || historyIndex < 0) return;
+    if (!device || !history.canUndo) return;
 
     flushPendingWorkForExport();
     resetInteractionState();
 
-    applyUndo(historyEntries[historyIndex]);
-    historyIndex--;
+    const entry = history.takeUndoEntry();
+    if (entry) applyUndo(entry);
     scheduleFrame();
   }
 
   export function redo() {
-    if (!device || historyIndex >= historyEntries.length - 1) return;
+    if (!device || !history.canRedo) return;
 
     flushPendingWorkForExport();
     resetInteractionState();
 
-    historyIndex++;
-    applyRedo(historyEntries[historyIndex]);
+    const entry = history.takeRedoEntry();
+    if (entry) applyRedo(entry);
     scheduleFrame();
   }
 
@@ -571,8 +490,8 @@
     activeLayerId = layer.id;
     syncLayerList();
     markCompositeDirty();
-    pushHistoryEntry({
-      kind: "layer-add",
+    history.push({
+      kind: "layer-add"},{
       layerId: layer.id,
       index,
       metadata: captureLayerMetadata(layer),
@@ -599,8 +518,8 @@
     activeLayerId = activeAfter;
     syncLayerList();
     markCompositeDirty();
-    pushHistoryEntry({
-      kind: "layer-delete",
+    history.push({
+      kind: "layer-delete"},{
       layerId: metadata.id,
       index,
       metadata,
@@ -630,8 +549,8 @@
     reorderLayerStack(afterOrder);
     syncLayerList();
     markCompositeDirty();
-    pushHistoryEntry({
-      kind: "layer-reorder",
+    history.push({
+      kind: "layer-reorder"},{
       beforeOrder,
       afterOrder,
       activeBefore: activeLayerId,
@@ -651,7 +570,7 @@
 
     syncLayerList();
     markCompositeDirty();
-    pushHistoryEntry({ kind: "layer-metadata", layerId: id, before, after });
+    history.push({ kind: "layer-metadata", layerId: id, before, after });
     scheduleFrame();
   }
 
@@ -1121,9 +1040,7 @@
       for (const layer of layers) {
         destroyLayer(layer);
       }
-      for (const entry of historyEntries) {
-        destroyHistoryEntry(entry);
-      }
+      history.clear();
       currentStrokeHistory?.before.destroy();
       currentStrokeHistory = null;
       device = null;
@@ -1145,8 +1062,7 @@
       layers = [];
       layerList = [];
       activeLayerId = null;
-      historyEntries = [];
-      historyIndex = -1;
+      history = new HistoryManager();
     };
   });
 
