@@ -15,16 +15,9 @@
   import { hexToVec4, withAlpha, type Rgba } from "./core/color";
   import { getStampHalfSize } from "./core/geometry";
   import { clamp } from "./core/math";
-  import type { LayerId, LayerMetadata } from "./core/types";
-  import { HistoryManager, type HistoryEntry, type LayerAddHistoryEntry } from "./document/history";
-  import {
-    applyLayerMetadata,
-    captureLayerMetadata,
-    createLayerList,
-    getNextLayerNumber,
-    type LayerListItem,
-    type PaintLayer,
-  } from "./document/layers";
+  import type { LayerId } from "./core/types";
+  import { type LayerListItem, type PaintLayer } from "./document/layers";
+  import { PaintDocumentController } from "./document/paintDocument";
   import { StrokeHistoryManager } from "./document/strokeHistory";
   import { GpuPaintRenderer } from "./gpu/paintRenderer";
   import { initializeGpuCanvas } from "./gpu/rendererSetup";
@@ -98,13 +91,12 @@
   // ---- layer state ----
   let documentWidth = $state(DEFAULT_CANVAS_WIDTH);
   let documentHeight = $state(DEFAULT_CANVAS_HEIGHT);
+  let documentController: PaintDocumentController | null = null;
   let layers: PaintLayer[] = [];
   let layerList = $state<LayerListItem[]>([]);
   let activeLayerId = $state<LayerId | null>(null);
-  let nextLayerNumber = 1;
 
   // ---- undo / redo state ----
-  let history = new HistoryManager();
   let strokeHistory = new StrokeHistoryManager();
 
   // ---- drawing state ----
@@ -163,28 +155,18 @@
   //  WebGPU helpers
   // ====================================================================
 
-  function getActiveLayer() {
-    return layers.find((layer) => layer.id === activeLayerId) ?? null;
+  function syncDocumentState() {
+    layers = documentController?.layers ?? [];
+    activeLayerId = documentController?.activeLayerId ?? null;
+    layerList = documentController?.layerList ?? [];
   }
 
-  function createPaintLayer(
-    metadata: Partial<LayerMetadata> | undefined = undefined,
-    sourcePixels: GPUTexture | undefined = undefined,
-  ) {
-    if (!renderer) {
-      throw new Error("Layer rendering is not ready.");
-    }
-
-    const fallbackName = metadata?.name ?? `Layer ${nextLayerNumber++}`;
-    return renderer.createLayer(metadata, fallbackName, sourcePixels);
+  function getActiveLayer() {
+    return documentController?.activeLayer ?? null;
   }
 
   function destroyLayer(layer: PaintLayer) {
-    renderer?.destroyLayer(layer);
-  }
-
-  function syncLayerList() {
-    layerList = createLayerList(layers, activeLayerId);
+    documentController?.destroyLayer(layer);
   }
 
   function markCompositeDirty() {
@@ -215,29 +197,18 @@
   }
 
   function clearHistory() {
-    history.clear();
+    documentController?.clearHistory();
     strokeHistory.clear();
   }
 
   function replaceLayers(nextLayers: PaintLayer[], nextActiveLayerId: LayerId | null) {
-    for (const layer of layers) {
-      destroyLayer(layer);
-    }
-
-    layers = nextLayers;
-    activeLayerId = nextActiveLayerId && layers.some((layer) => layer.id === nextActiveLayerId)
-      ? nextActiveLayerId
-      : layers[layers.length - 1]?.id ?? null;
-    syncLayerList();
-    markCompositeDirty();
-  }
-
-  function updateNextLayerNumber() {
-    nextLayerNumber = getNextLayerNumber(layers);
+    documentController?.replaceLayers(nextLayers, nextActiveLayerId);
+    syncDocumentState();
   }
 
   function finalizePendingPaintHistory() {
-    strokeHistory.finalize(history);
+    if (!documentController) return;
+    strokeHistory.finalize(documentController.history);
   }
 
   function resetInteractionState() {
@@ -248,194 +219,56 @@
     if (renderer) renderer.stampDistanceSinceLastStamp = 0;
   }
 
-  function restoreLayerAdd(entry: LayerAddHistoryEntry) {
-    const index = Math.min(entry.index, layers.length);
-    layers.splice(index, 0, createPaintLayer(entry.metadata));
-    activeLayerId = entry.activeAfter;
-  }
-
-  function reorderLayerStack(order: LayerId[]) {
-    const byId = new Map(layers.map((layer) => [layer.id, layer]));
-    layers = order
-      .map((id) => byId.get(id))
-      .filter((layer): layer is PaintLayer => Boolean(layer));
-  }
-
-  function removeLayerById(layerId: LayerId) {
-    const index = layers.findIndex((layer) => layer.id === layerId);
-    if (index < 0) return;
-    const [layer] = layers.splice(index, 1);
-    destroyLayer(layer);
-  }
-
-  function applyUndo(entry: HistoryEntry) {
-    if (!renderer) return;
-
-    if (entry.kind === "paint") {
-      const layer = layers.find((item) => item.id === entry.layerId);
-      if (!layer) return;
-      entry.redo?.destroy();
-      entry.redo = renderer.copyTexture(layer.texture, "Paint redo snapshot");
-      renderer.restoreTexture(layer.texture, entry.before);
-      activeLayerId = entry.layerId;
-    } else if (entry.kind === "layer-metadata") {
-      const layer = layers.find((item) => item.id === entry.layerId);
-      if (layer) applyLayerMetadata(layer, entry.before);
-    } else if (entry.kind === "layer-add") {
-      removeLayerById(entry.layerId);
-      activeLayerId = entry.activeBefore;
-    } else if (entry.kind === "layer-delete") {
-      const index = Math.min(entry.index, layers.length);
-      layers.splice(index, 0, createPaintLayer(entry.metadata, entry.pixels));
-      activeLayerId = entry.activeBefore;
-    } else if (entry.kind === "layer-reorder") {
-      reorderLayerStack(entry.beforeOrder);
-      activeLayerId = entry.activeBefore;
-    }
-
-    syncLayerList();
-    markCompositeDirty();
-  }
-
-  function applyRedo(entry: HistoryEntry) {
-    if (!renderer) return;
-
-    if (entry.kind === "paint") {
-      const layer = layers.find((item) => item.id === entry.layerId);
-      if (!layer || !entry.redo) return;
-      renderer.restoreTexture(layer.texture, entry.redo);
-      activeLayerId = entry.layerId;
-    } else if (entry.kind === "layer-metadata") {
-      const layer = layers.find((item) => item.id === entry.layerId);
-      if (layer) applyLayerMetadata(layer, entry.after);
-    } else if (entry.kind === "layer-add") {
-      restoreLayerAdd(entry);
-    } else if (entry.kind === "layer-delete") {
-      removeLayerById(entry.layerId);
-      activeLayerId = entry.activeAfter;
-    } else if (entry.kind === "layer-reorder") {
-      reorderLayerStack(entry.afterOrder);
-      activeLayerId = entry.activeAfter;
-    }
-
-    syncLayerList();
-    markCompositeDirty();
-  }
-
   export function undo() {
-    if (!renderer || !history.canUndo) return;
+    if (!renderer || !documentController?.canUndo) return;
 
     flushPendingWorkForExport();
     resetInteractionState();
 
-    const entry = history.takeUndoEntry();
-    if (entry) applyUndo(entry);
+    documentController.undo();
+    syncDocumentState();
     scheduleFrame();
   }
 
   export function redo() {
-    if (!renderer || !history.canRedo) return;
+    if (!renderer || !documentController?.canRedo) return;
 
     flushPendingWorkForExport();
     resetInteractionState();
 
-    const entry = history.takeRedoEntry();
-    if (entry) applyRedo(entry);
+    documentController.redo();
+    syncDocumentState();
     scheduleFrame();
   }
 
   export function addLayer() {
-    if (!renderer) return;
-
-    const activeIndex = layers.findIndex((layer) => layer.id === activeLayerId);
-    const index = activeIndex >= 0 ? activeIndex + 1 : layers.length;
-    const activeBefore = activeLayerId;
-    const layer = createPaintLayer();
-    layers.splice(index, 0, layer);
-    activeLayerId = layer.id;
-    syncLayerList();
-    markCompositeDirty();
-    history.push({
-      kind: "layer-add",
-      layerId: layer.id,
-      index,
-      metadata: captureLayerMetadata(layer),
-      activeBefore,
-      activeAfter: layer.id,
-    });
+    if (!documentController) return;
+    documentController.addLayer();
+    syncDocumentState();
     scheduleFrame();
   }
 
   export function deleteLayer(layerId: LayerId) {
-    if (!renderer || layers.length <= 1 || !activeLayerId) return;
-
-    const index = layers.findIndex((layer) => layer.id === layerId);
-    if (index < 0) return;
-
-    const activeBefore = activeLayerId;
-    const [layer] = layers.splice(index, 1);
-    const pixels = renderer.copyTexture(layer.texture, "Deleted layer snapshot");
-    const metadata = captureLayerMetadata(layer);
-    const activeAfter = activeBefore === metadata.id
-      ? layers[Math.min(index, layers.length - 1)]?.id ?? null
-      : activeBefore;
-    destroyLayer(layer);
-    activeLayerId = activeAfter;
-    syncLayerList();
-    markCompositeDirty();
-    history.push({
-      kind: "layer-delete",
-      layerId: metadata.id,
-      index,
-      metadata,
-      pixels,
-      activeBefore,
-      activeAfter,
-    });
+    if (!documentController) return;
+    documentController.deleteLayer(layerId);
+    syncDocumentState();
     scheduleFrame();
   }
 
   export function setActiveLayer(id: LayerId) {
-    if (!layers.some((layer) => layer.id === id)) return;
-    activeLayerId = id;
-    syncLayerList();
+    documentController?.setActiveLayer(id);
+    syncDocumentState();
   }
 
   export function setLayerOrder(topToBottomIds: LayerId[]) {
-    if (topToBottomIds.length !== layers.length) return;
-
-    const currentIds = new Set(layers.map((layer) => layer.id));
-    if (!topToBottomIds.every((id) => currentIds.has(id))) return;
-
-    const beforeOrder = layers.map((layer) => layer.id);
-    const afterOrder = topToBottomIds.slice().reverse();
-    if (beforeOrder.join("\0") === afterOrder.join("\0")) return;
-
-    reorderLayerStack(afterOrder);
-    syncLayerList();
-    markCompositeDirty();
-    history.push({
-      kind: "layer-reorder",
-      beforeOrder,
-      afterOrder,
-      activeBefore: activeLayerId,
-      activeAfter: activeLayerId,
-    });
+    documentController?.setLayerOrder(topToBottomIds);
+    syncDocumentState();
     scheduleFrame();
   }
 
   function updateLayerMetadata(id: LayerId, update: (layer: PaintLayer) => void) {
-    const layer = layers.find((item) => item.id === id);
-    if (!layer) return;
-
-    const before = captureLayerMetadata(layer);
-    update(layer);
-    const after = captureLayerMetadata(layer);
-    if (JSON.stringify(before) === JSON.stringify(after)) return;
-
-    syncLayerList();
-    markCompositeDirty();
-    history.push({ kind: "layer-metadata", layerId: id, before, after });
+    documentController?.updateLayerMetadata(id, update);
+    syncDocumentState();
     scheduleFrame();
   }
 
@@ -482,9 +315,8 @@
     documentHeight = nextHeight;
     renderer.resizeDocument(documentWidth, documentHeight);
 
-    const initialLayer = createPaintLayer({ name: "Layer 1" });
+    const initialLayer = documentController!.createLayer({ name: "Layer 1" });
     replaceLayers([initialLayer], initialLayer.id);
-    nextLayerNumber = 2;
     fitToScreen();
     scheduleFrame();
   }
@@ -537,7 +369,7 @@
 
     try {
       for (const decodedLayer of decodedLayers) {
-        const layer = createPaintLayer(decodedLayer.metadata);
+        const layer = documentController!.createLayer(decodedLayer.metadata);
         renderer.uploadLayerPixels(layer, decodedLayer.pixels);
         loadedLayers.push(layer);
       }
@@ -549,7 +381,8 @@
     }
 
     replaceLayers(loadedLayers, manifest.activeLayerId);
-    updateNextLayerNumber();
+    documentController?.updateNextLayerNumber();
+    syncDocumentState();
     zoom = clamp(manifest.view.zoom, MIN_ZOOM, MAX_ZOOM);
     offsetX = manifest.view.offsetX;
     offsetY = manifest.view.offsetY;
@@ -621,10 +454,9 @@
         onFrameComplete: finalizePendingPaintHistory,
       });
 
-      nextLayerNumber = 2;
-      layers = [renderer.initialLayer];
-      activeLayerId = renderer.initialLayer.id;
-      syncLayerList();
+      documentController = new PaintDocumentController(renderer);
+      documentController.setInitialLayer(renderer.initialLayer);
+      syncDocumentState();
       markCompositeDirty();
 
       if (canvasWidth > 0 && canvasHeight > 0) {
@@ -643,17 +475,14 @@
         cancelAnimationFrame(eyedropperRafId);
         eyedropperRafId = null;
       }
-      for (const layer of layers) {
-        destroyLayer(layer);
-      }
+      documentController?.dispose();
       renderer?.dispose();
-      history.clear();
       strokeHistory.clear();
+      documentController = null;
       renderer = null;
       layers = [];
       layerList = [];
       activeLayerId = null;
-      history = new HistoryManager();
     };
   });
 
