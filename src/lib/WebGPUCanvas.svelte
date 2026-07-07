@@ -11,12 +11,7 @@
     MAX_STAMPS_PER_FRAME,
     MAX_ZOOM,
     MIN_CANVAS_SIZE,
-    MIN_PRESSURE_OPACITY,
-    MIN_PRESSURE_SIZE,
     MIN_ZOOM,
-    PRESSURE_EPSILON,
-    PRESSURE_FALLBACK,
-    PRESSURE_OPACITY_GAMMA,
   } from "./core/constants";
   import { hexToVec4, withAlpha, type Rgba } from "./core/color";
   import { getStampBounds, getStampHalfSize, getStampSpacing } from "./core/geometry";
@@ -58,6 +53,15 @@
     restoreTexture,
     uploadTexturePixels,
   } from "./gpu/textures";
+  import {
+    getBrushOpacity,
+    getBrushPreviewRadius,
+    getBrushRadius,
+    getMinimumPressureOpacity,
+    getMinimumPressureRadius,
+    hasRealPressure,
+    resizeBrushSize,
+  } from "./input/brush";
   import { createProjectBlob, decodeProjectBlob } from "./persistence/projectIO";
   import { pixelsToPngBlob } from "./persistence/png";
   import brushStampUrl from "../assets/charcoal-removebg-preview.png";
@@ -1259,8 +1263,8 @@
       const screenX = e.clientX - rect.left;
       const screenY = e.clientY - rect.top;
       const { x, y } = screenToCanvas(screenX, screenY);
-      const radius = getRadius(e, brushSize * MIN_PRESSURE_SIZE / 2);
-      const opacity = getOpacity(e, MIN_PRESSURE_OPACITY);
+      const radius = getBrushRadius(e, brushSize, strokeUsesPressure, getMinimumPressureRadius(brushSize));
+      const opacity = getBrushOpacity(e, strokeUsesPressure, getMinimumPressureOpacity());
       const rgba = hexToVec4(color);
       lastPoint = { x, y, radius, opacity };
       distanceSinceLastStamp = 0;
@@ -1278,10 +1282,7 @@
     }
 
     if (isResizingBrush) {
-      const deltaY = e.clientY - resizeStartY;
-      brushSize = Math.round(
-        clamp(resizeStartBrushSize - deltaY, 1, 500),
-      );
+      brushSize = resizeBrushSize(resizeStartBrushSize, resizeStartY, e.clientY);
       updateBrushPreview(e);
       return;
     }
@@ -1310,8 +1311,8 @@
     const screenY = e.clientY - rect.top;
     const { x, y } = screenToCanvas(screenX, screenY);
 
-    const radius = getRadius(e, lastPoint.radius || brushSize * MIN_PRESSURE_SIZE / 2);
-    const opacity = getOpacity(e, lastPoint.opacity);
+    const radius = getBrushRadius(e, brushSize, strokeUsesPressure, lastPoint.radius || getMinimumPressureRadius(brushSize));
+    const opacity = getBrushOpacity(e, strokeUsesPressure, lastPoint.opacity);
     stampLine(
       lastPoint.x,
       lastPoint.y,
@@ -1385,54 +1386,16 @@
     const rect = canvas.getBoundingClientRect();
     brushPreviewX = e.clientX - rect.left;
     brushPreviewY = e.clientY - rect.top;
-    brushPreviewRadius = getPreviewRadius(e);
+    brushPreviewRadius = getBrushPreviewRadius({
+      e,
+      isDrawing,
+      usesPressure: strokeUsesPressure,
+      brushSize,
+      fallbackRadius: brushPreviewRadius || getMinimumPressureRadius(brushSize),
+    });
     brushPreviewVisible = true;
   }
 
-  function getPreviewRadius(e: PointerEvent): number {
-    // Hover always previews the lowest pressure size.
-    if (!isDrawing) {
-      return brushSize * MIN_PRESSURE_SIZE / 2;
-    }
-
-    if (strokeUsesPressure) {
-      return getRadius(e, brushPreviewRadius || brushSize * MIN_PRESSURE_SIZE / 2);
-    }
-
-    return brushSize / 2;
-  }
-
-  function hasRealPressure(e: PointerEvent): boolean {
-    const p = typeof e.pressure === "number" ? e.pressure : 0;
-    return e.pointerType === "pen" || (p > 0 && Math.abs(p - PRESSURE_FALLBACK) > PRESSURE_EPSILON);
-  }
-
-  function getRadius(e: PointerEvent, fallbackRadius: number): number {
-    if (!strokeUsesPressure) {
-      return brushSize / 2;
-    }
-
-    const p = typeof e.pressure === "number" ? e.pressure : 0;
-    if (p > 0) {
-      const pressureScale = MIN_PRESSURE_SIZE + (1 - MIN_PRESSURE_SIZE) * clamp(p, 0, 1);
-      return brushSize * pressureScale / 2;
-    }
-
-    return fallbackRadius;
-  }
-
-  function getOpacity(e: PointerEvent, fallbackOpacity: number): number {
-    if (!strokeUsesPressure) return 1;
-
-    const p = typeof e.pressure === "number" ? e.pressure : 0;
-    if (p > 0) {
-      const pressure = clamp(p, 0, 1);
-      return MIN_PRESSURE_OPACITY +
-        (1 - MIN_PRESSURE_OPACITY) * Math.pow(pressure, PRESSURE_OPACITY_GAMMA);
-    }
-
-    return fallbackOpacity;
-  }
 
   // ====================================================================
   //  Keyboard shortcuts
