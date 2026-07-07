@@ -8,7 +8,6 @@
     DEFAULT_CANVAS_HEIGHT,
     DEFAULT_CANVAS_WIDTH,
     MAX_CANVAS_SIZE,
-    MAX_STAMPS_PER_FRAME,
     MAX_ZOOM,
     MIN_CANVAS_SIZE,
     MIN_ZOOM,
@@ -26,22 +25,8 @@
     type LayerListItem,
     type PaintLayer,
   } from "./document/layers";
-  import { createCompositeTextureResources } from "./gpu/compositeResources";
-  import { createPaintLayerResource, destroyPaintLayerResource } from "./gpu/layerResources";
-  import { premultipliedRgbaToHex, readTexturePixel } from "./gpu/readback";
-  import {
-    blitCompositeToViewport as renderCompositeToViewport,
-    rebuildComposite as renderRebuildComposite,
-    renderStamps,
-    writeViewUniforms as writeGpuViewUniforms,
-  } from "./gpu/rendering";
+  import { GpuPaintRenderer } from "./gpu/paintRenderer";
   import { initializeGpuCanvas } from "./gpu/rendererSetup";
-  import {
-    copyTexture,
-    readTexturePixels,
-    restoreTexture,
-    uploadTexturePixels,
-  } from "./gpu/textures";
   import {
     getBrushOpacity,
     getBrushPreviewRadius,
@@ -59,9 +44,7 @@
     screenToCanvas as screenToCanvasPoint,
     zoomToActualSize,
   } from "./input/panZoom";
-  import { StampQueue } from "./input/stampQueue";
   import { createProjectBlob, decodeProjectBlob } from "./persistence/projectIO";
-  import { pixelsToPngBlob } from "./persistence/png";
   import brushStampUrl from "../assets/charcoal-removebg-preview.png";
   import brushStampOutlineUrl from "../assets/charcoal-removebg-preview.png";
 
@@ -108,24 +91,8 @@
   let brushPreviewWidth = $derived(Math.max(1, getStampHalfSize(brushPreviewRadius).halfWidth * 2 * zoom));
   let brushPreviewHeight = $derived(Math.max(1, getStampHalfSize(brushPreviewRadius).halfHeight * 2 * zoom));
 
-  // ---- WebGPU refs ----
-  let device: GPUDevice | null = $state(null);
-  let context: GPUCanvasContext | null = $state(null);
-  let compositeTexture: GPUTexture | null = $state(null);
-  let compositeTextureView: GPUTextureView | null = $state(null);
-  let brushStampTexture: GPUTexture | null = $state(null);
-  let stampBuffer: GPUBuffer | null = $state(null);
-  let stampUniformBuffer: GPUBuffer | null = $state(null);
-  let viewUniformBuffer: GPUBuffer | null = $state(null);
-  let stampPipeline: GPURenderPipeline | null = $state(null);
-  let compositePipeline: GPURenderPipeline | null = $state(null);
-  let renderPipeline: GPURenderPipeline | null = $state(null);
-  let stampBindGroup: GPUBindGroup | null = $state(null);
-  let renderBindGroup: GPUBindGroup | null = $state(null);
-  let compositeBindGroupLayout: GPUBindGroupLayout | null = null;
-  let compositeSampler: GPUSampler | null = null;
-  let renderBindGroupLayout: GPUBindGroupLayout | null = null;
-  let paintSampler: GPUSampler | null = null;
+  // ---- WebGPU renderer ----
+  let renderer: GpuPaintRenderer | null = $state(null);
 
   // ---- layer state ----
   let documentWidth = $state(DEFAULT_CANVAS_WIDTH);
@@ -133,7 +100,6 @@
   let layers: PaintLayer[] = [];
   let layerList = $state<LayerListItem[]>([]);
   let activeLayerId = $state<LayerId | null>(null);
-  let compositeDirty = true;
   let nextLayerNumber = 1;
 
   // ---- undo / redo state ----
@@ -158,7 +124,6 @@
   let eyedropperLastScreenX = 0;
   let eyedropperLastScreenY = 0;
   let eyedropperRafId: number | null = null;
-  let eyedropperReadBuffer: GPUBuffer | null = null;
 
   // ---- pan tracking ----
   let panStart = { clientX: 0, clientY: 0, offsetX: 0, offsetY: 0 };
@@ -166,16 +131,10 @@
   // ---- wheel accumulator ----
   let wheelAccum = 0;
 
-  // ---- pending stamps (batched per frame) ----
-  let stampQueue = new StampQueue();
-  let rafId: number | null = null;
 
   // ---- current canvas internal size (set by ResizeObserver) ----
   let canvasWidth = $state(0);
   let canvasHeight = $state(0);
-
-  // ---- per-frame CPU buffer for stamp data (avoid per-frame alloc) ----
-  let stampDataView: Float32Array;
 
   // ====================================================================
   //  Helpers
@@ -197,14 +156,6 @@
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  async function readTextureAsPngBlob(dev: GPUDevice, texture: GPUTexture) {
-    return await pixelsToPngBlob(
-      await readTexturePixels(dev, texture, documentWidth, documentHeight),
-      documentWidth,
-      documentHeight,
-    );
-  }
-
   function screenToCanvas(screenX: number, screenY: number) {
     return screenToCanvasPoint(screenX, screenY, { zoom, offsetX, offsetY });
   }
@@ -213,56 +164,24 @@
   //  WebGPU helpers
   // ====================================================================
 
-  function recreateCompositeResources(dev: GPUDevice) {
-    if (!renderBindGroupLayout || !paintSampler || !viewUniformBuffer) {
-      throw new Error("Viewport rendering is not ready.");
-    }
-
-    const oldCompositeTexture = compositeTexture;
-    const resources = createCompositeTextureResources({
-      device: dev,
-      width: documentWidth,
-      height: documentHeight,
-      renderBindGroupLayout,
-      paintSampler,
-      viewUniformBuffer,
-    });
-
-    compositeTexture = resources.texture;
-    compositeTextureView = resources.view;
-    renderBindGroup = resources.renderBindGroup;
-    oldCompositeTexture?.destroy();
-    markCompositeDirty();
-  }
-
   function getActiveLayer() {
     return layers.find((layer) => layer.id === activeLayerId) ?? null;
   }
 
   function createPaintLayer(
-    dev: GPUDevice,
     metadata: Partial<LayerMetadata> | undefined = undefined,
     sourcePixels: GPUTexture | undefined = undefined,
   ) {
-    if (!compositeBindGroupLayout || !compositeSampler) {
-      throw new Error("Layer compositing is not ready.");
+    if (!renderer) {
+      throw new Error("Layer rendering is not ready.");
     }
 
     const fallbackName = metadata?.name ?? `Layer ${nextLayerNumber++}`;
-    return createPaintLayerResource({
-      device: dev,
-      width: documentWidth,
-      height: documentHeight,
-      compositeBindGroupLayout,
-      compositeSampler,
-      metadata,
-      fallbackName,
-      sourcePixels,
-    });
+    return renderer.createLayer(metadata, fallbackName, sourcePixels);
   }
 
   function destroyLayer(layer: PaintLayer) {
-    destroyPaintLayerResource(layer);
+    renderer?.destroyLayer(layer);
   }
 
   function syncLayerList() {
@@ -270,7 +189,30 @@
   }
 
   function markCompositeDirty() {
-    compositeDirty = true;
+    renderer?.markCompositeDirty();
+  }
+
+  function syncRendererViewState() {
+    renderer?.setViewState({
+      cssWidth: canvasEl?.clientWidth ?? canvasWidth,
+      cssHeight: canvasEl?.clientHeight ?? canvasHeight,
+      canvasWidth,
+      canvasHeight,
+      zoom,
+      offsetX,
+      offsetY,
+    });
+  }
+
+  function scheduleFrame() {
+    syncRendererViewState();
+    renderer?.scheduleFrame();
+  }
+
+  function flushPendingWorkForExport() {
+    syncRendererViewState();
+    renderer?.flushPendingWork();
+    if (shouldSaveHistoryAfterFrame) finalizePendingPaintHistory();
   }
 
   function clearHistory() {
@@ -322,12 +264,12 @@
     isPanning = false;
     isResizingBrush = false;
     strokeUsesPressure = false;
-    stampQueue.distanceSinceLastStamp = 0;
+    if (renderer) renderer.stampDistanceSinceLastStamp = 0;
   }
 
   function restoreLayerAdd(entry: LayerAddHistoryEntry) {
     const index = Math.min(entry.index, layers.length);
-    layers.splice(index, 0, createPaintLayer(device!, entry.metadata));
+    layers.splice(index, 0, createPaintLayer(entry.metadata));
     activeLayerId = entry.activeAfter;
   }
 
@@ -346,14 +288,14 @@
   }
 
   function applyUndo(entry: HistoryEntry) {
-    if (!device) return;
+    if (!renderer) return;
 
     if (entry.kind === "paint") {
       const layer = layers.find((item) => item.id === entry.layerId);
       if (!layer) return;
       entry.redo?.destroy();
-      entry.redo = copyTexture(device, layer.texture, documentWidth, documentHeight, "Paint redo snapshot");
-      restoreTexture(device, layer.texture, entry.before, documentWidth, documentHeight);
+      entry.redo = renderer.copyTexture(layer.texture, "Paint redo snapshot");
+      renderer.restoreTexture(layer.texture, entry.before);
       activeLayerId = entry.layerId;
     } else if (entry.kind === "layer-metadata") {
       const layer = layers.find((item) => item.id === entry.layerId);
@@ -363,7 +305,7 @@
       activeLayerId = entry.activeBefore;
     } else if (entry.kind === "layer-delete") {
       const index = Math.min(entry.index, layers.length);
-      layers.splice(index, 0, createPaintLayer(device, entry.metadata, entry.pixels));
+      layers.splice(index, 0, createPaintLayer(entry.metadata, entry.pixels));
       activeLayerId = entry.activeBefore;
     } else if (entry.kind === "layer-reorder") {
       reorderLayerStack(entry.beforeOrder);
@@ -375,12 +317,12 @@
   }
 
   function applyRedo(entry: HistoryEntry) {
-    if (!device) return;
+    if (!renderer) return;
 
     if (entry.kind === "paint") {
       const layer = layers.find((item) => item.id === entry.layerId);
       if (!layer || !entry.redo) return;
-      restoreTexture(device, layer.texture, entry.redo, documentWidth, documentHeight);
+      renderer.restoreTexture(layer.texture, entry.redo);
       activeLayerId = entry.layerId;
     } else if (entry.kind === "layer-metadata") {
       const layer = layers.find((item) => item.id === entry.layerId);
@@ -400,7 +342,7 @@
   }
 
   export function undo() {
-    if (!device || !history.canUndo) return;
+    if (!renderer || !history.canUndo) return;
 
     flushPendingWorkForExport();
     resetInteractionState();
@@ -411,7 +353,7 @@
   }
 
   export function redo() {
-    if (!device || !history.canRedo) return;
+    if (!renderer || !history.canRedo) return;
 
     flushPendingWorkForExport();
     resetInteractionState();
@@ -422,12 +364,12 @@
   }
 
   export function addLayer() {
-    if (!device) return;
+    if (!renderer) return;
 
     const activeIndex = layers.findIndex((layer) => layer.id === activeLayerId);
     const index = activeIndex >= 0 ? activeIndex + 1 : layers.length;
     const activeBefore = activeLayerId;
-    const layer = createPaintLayer(device);
+    const layer = createPaintLayer();
     layers.splice(index, 0, layer);
     activeLayerId = layer.id;
     syncLayerList();
@@ -444,14 +386,14 @@
   }
 
   export function deleteLayer(layerId: LayerId) {
-    if (!device || layers.length <= 1 || !activeLayerId) return;
+    if (!renderer || layers.length <= 1 || !activeLayerId) return;
 
     const index = layers.findIndex((layer) => layer.id === layerId);
     if (index < 0) return;
 
     const activeBefore = activeLayerId;
     const [layer] = layers.splice(index, 1);
-    const pixels = copyTexture(device, layer.texture, documentWidth, documentHeight, "Deleted layer snapshot");
+    const pixels = renderer.copyTexture(layer.texture, "Deleted layer snapshot");
     const metadata = captureLayerMetadata(layer);
     const activeAfter = activeBefore === metadata.id
       ? layers[Math.min(index, layers.length - 1)]?.id ?? null
@@ -534,59 +476,32 @@
     });
   }
 
-  function cancelScheduledFrame() {
-    if (rafId === null) return;
-    cancelAnimationFrame(rafId);
-    rafId = null;
-  }
-
-  function flushPendingWorkForExport() {
-    cancelScheduledFrame();
-
-    const maxFlushes = Math.ceil(stampQueue.length / MAX_STAMPS_PER_FRAME) + 2;
-    let flushes = 0;
-    while (stampQueue.length > 0) {
-      if (flushes > maxFlushes) {
-        throw new Error("Could not flush pending paint data before export.");
-      }
-      flushFrame();
-      cancelScheduledFrame();
-      flushes++;
-    }
-
-    if (shouldSaveHistoryAfterFrame || compositeDirty) {
-      flushFrame();
-      cancelScheduledFrame();
-    }
-  }
-
   export async function exportAsPng() {
-    if (!device || !compositeTexture) {
+    if (!renderer) {
       throw new Error("Canvas is not ready to export yet.");
     }
 
     flushPendingWorkForExport();
-    const blob = await readTextureAsPngBlob(device, compositeTexture);
+    const blob = await renderer.readCompositeAsPngBlob();
     downloadBlob(blob, makeExportFilename());
   }
 
   export function newProject(width = DEFAULT_CANVAS_WIDTH, height = DEFAULT_CANVAS_HEIGHT) {
-    if (!device) throw new Error("Canvas is not ready to create a new project yet.");
+    if (!renderer) throw new Error("Canvas is not ready to create a new project yet.");
 
     const nextWidth = Math.round(clamp(width, MIN_CANVAS_SIZE, MAX_CANVAS_SIZE));
     const nextHeight = Math.round(clamp(height, MIN_CANVAS_SIZE, MAX_CANVAS_SIZE));
 
-    cancelScheduledFrame();
+    renderer.cancelScheduledFrame();
     resetInteractionState();
-    stampQueue.clear();
+    renderer.clearStamps();
     clearHistory();
 
     documentWidth = nextWidth;
     documentHeight = nextHeight;
-    device.queue.writeBuffer(stampUniformBuffer!, 0, new Float32Array([documentWidth, documentHeight, 0, 0]));
-    recreateCompositeResources(device);
+    renderer.resizeDocument(documentWidth, documentHeight);
 
-    const initialLayer = createPaintLayer(device, { name: "Layer 1" });
+    const initialLayer = createPaintLayer({ name: "Layer 1" });
     replaceLayers([initialLayer], initialLayer.id);
     nextLayerNumber = 2;
     fitToScreen();
@@ -594,7 +509,7 @@
   }
 
   export async function saveProject() {
-    if (!device) throw new Error("Canvas is not ready to save yet.");
+    if (!renderer) throw new Error("Canvas is not ready to save yet.");
 
     flushPendingWorkForExport();
 
@@ -617,33 +532,32 @@
           name: layer.name,
           visible: layer.visible,
           locked: layer.locked,
-          pixels: await readTexturePixels(device, layer.texture, documentWidth, documentHeight),
+          pixels: await renderer.readLayerPixels(layer),
         })),
       ),
     });
   }
 
   export async function loadProject(blob: Blob) {
-    if (!device) throw new Error("Canvas is not ready to open a project yet.");
+    if (!renderer) throw new Error("Canvas is not ready to open a project yet.");
 
-    cancelScheduledFrame();
+    renderer.cancelScheduledFrame();
     resetInteractionState();
-    stampQueue.clear();
+    renderer.clearStamps();
 
     const { manifest, layers: decodedLayers } = await decodeProjectBlob(blob);
     const loadedLayers: PaintLayer[] = [];
     resetInteractionState();
-    stampQueue.clear();
+    renderer.clearStamps();
     clearHistory();
     documentWidth = manifest.canvas.width;
     documentHeight = manifest.canvas.height;
-    device.queue.writeBuffer(stampUniformBuffer!, 0, new Float32Array([documentWidth, documentHeight, 0, 0]));
-    recreateCompositeResources(device);
+    renderer.resizeDocument(documentWidth, documentHeight);
 
     try {
       for (const decodedLayer of decodedLayers) {
-        const layer = createPaintLayer(device, decodedLayer.metadata);
-        uploadTexturePixels(device, layer.texture, decodedLayer.pixels, documentWidth, documentHeight);
+        const layer = createPaintLayer(decodedLayer.metadata);
+        renderer.uploadLayerPixels(layer, decodedLayer.pixels);
         loadedLayers.push(layer);
       }
     } catch (e) {
@@ -665,116 +579,17 @@
     return { width: documentWidth, height: documentHeight };
   }
 
-  function rebuildComposite(encoder: GPUCommandEncoder) {
-    if (!compositeTextureView || !compositePipeline) return;
-    renderRebuildComposite(encoder, compositeTextureView, compositePipeline, layers);
-    compositeDirty = false;
-  }
-
-  function blitCompositeToViewport(encoder: GPUCommandEncoder) {
-    if (!context || !renderPipeline || !renderBindGroup) return;
-    writeViewUniforms(device!);
-    renderCompositeToViewport(encoder, context, renderPipeline, renderBindGroup);
-  }
-
-  /**
-   * Process queued stamps into the active layer, composite visible layers, then
-   * blit the composite texture to the visible canvas.
-   */
-  function flushFrame() {
-    if (
-      !device ||
-      !context ||
-      !compositeTexture ||
-      !stampBuffer ||
-      !viewUniformBuffer ||
-      !stampPipeline ||
-      !compositePipeline ||
-      !renderPipeline ||
-      !stampBindGroup ||
-      !renderBindGroup
-    ) {
-      rafId = null;
-      return;
-    }
-
-    if (canvasWidth === 0 || canvasHeight === 0) {
-      rafId = null;
-      return;
-    }
-
-    const stamps = stampQueue.takeAll();
-    const n = stamps.length;
-
-    const encoder = device.createCommandEncoder();
-
-    if (n > 0) {
-      const activeLayer = getActiveLayer();
-      const count = Math.min(n, MAX_STAMPS_PER_FRAME);
-      if (n > count) {
-        stampQueue.prepend(stamps.slice(count));
-      }
-
-      const rendered = renderStamps({
-        encoder,
-        device,
-        stampBuffer,
-        stampDataView,
-        stamps,
-        count,
-        documentWidth,
-        documentHeight,
-        activeLayer,
-        stampPipeline,
-        stampBindGroup,
-      });
-      if (rendered) markCompositeDirty();
-    }
-
-    if (compositeDirty) rebuildComposite(encoder);
-    blitCompositeToViewport(encoder);
-
-    device.queue.submit([encoder.finish()]);
-
-    if (stampQueue.length > 0) {
-      scheduleFrame();
-      return;
-    }
-
-    finalizePendingPaintHistory();
-    rafId = null;
-  }
-
-  function writeViewUniforms(dev: GPUDevice) {
-    writeGpuViewUniforms(dev, viewUniformBuffer!, {
-      cssWidth: canvasEl?.clientWidth ?? canvasWidth,
-      cssHeight: canvasEl?.clientHeight ?? canvasHeight,
-      canvasWidth,
-      canvasHeight,
-      zoom,
-      offsetX,
-      offsetY,
-      documentWidth,
-      documentHeight,
-    });
-  }
-
-  function scheduleFrame() {
-    if (rafId !== null) return;
-    rafId = requestAnimationFrame(flushFrame);
-  }
-
   function queueStamp(
     x: number,
     y: number,
     radius: number,
     rgba: Rgba,
   ) {
-    const queued = stampQueue.queueStamp(x, y, radius, rgba, documentWidth, documentHeight);
+    syncRendererViewState();
+    const queued = renderer?.queueStamp(x, y, radius, rgba) ?? false;
     if (!queued) return false;
 
     if (isDrawing) strokeHadPaint = true;
-    scheduleFrame();
     return true;
   }
 
@@ -789,23 +604,11 @@
     o2: number,
     rgba: Rgba,
   ) {
-    const queued = stampQueue.stampLine({
-      x1,
-      y1,
-      r1,
-      o1,
-      x2,
-      y2,
-      r2,
-      o2,
-      rgba,
-      documentWidth,
-      documentHeight,
-    });
-    if (queued === 0) return;
+    syncRendererViewState();
+    const queued = renderer?.stampLine({ x1, y1, r1, o1, x2, y2, r2, o2, rgba }) ?? false;
+    if (!queued) return;
 
     if (isDrawing) strokeHadPaint = true;
-    scheduleFrame();
   }
 
   // ====================================================================
@@ -828,32 +631,20 @@
       });
       if (!resources) return;
 
-      compositeBindGroupLayout = resources.compositeBindGroupLayout;
-      compositeSampler = resources.compositeSampler;
+      renderer = new GpuPaintRenderer(resources, documentWidth, documentHeight, {
+        getLayers: () => layers,
+        getActiveLayer,
+        onPaintRendered: () => {
+          strokeHadPaint = true;
+        },
+        onFrameComplete: finalizePendingPaintHistory,
+      });
 
       nextLayerNumber = 2;
-      layers = [resources.initialLayer];
-      activeLayerId = resources.initialLayer.id;
+      layers = [renderer.initialLayer];
+      activeLayerId = renderer.initialLayer.id;
       syncLayerList();
       markCompositeDirty();
-
-      device = resources.device;
-      context = resources.context;
-      compositeTexture = resources.compositeTexture;
-      compositeTextureView = resources.compositeTextureView;
-      brushStampTexture = resources.brushStampTexture;
-      stampBuffer = resources.stampBuffer;
-      stampUniformBuffer = resources.stampUniformBuffer;
-      viewUniformBuffer = resources.viewUniformBuffer;
-      eyedropperReadBuffer = resources.eyedropperReadBuffer;
-      stampPipeline = resources.stampPipeline;
-      compositePipeline = resources.compositePipeline;
-      renderPipeline = resources.renderPipeline;
-      stampBindGroup = resources.stampBindGroup;
-      renderBindGroup = resources.renderBindGroup;
-      renderBindGroupLayout = resources.renderBindGroupLayout;
-      paintSampler = resources.paintSampler;
-      stampDataView = resources.stampDataView;
 
       if (canvasWidth > 0 && canvasHeight > 0) {
         scheduleFrame();
@@ -871,34 +662,14 @@
         cancelAnimationFrame(eyedropperRafId);
         eyedropperRafId = null;
       }
-      compositeTexture?.destroy();
-      brushStampTexture?.destroy();
-      stampBuffer?.destroy();
-      stampUniformBuffer?.destroy();
-      viewUniformBuffer?.destroy();
-      eyedropperReadBuffer?.destroy();
       for (const layer of layers) {
         destroyLayer(layer);
       }
+      renderer?.dispose();
       history.clear();
       currentStrokeHistory?.before.destroy();
       currentStrokeHistory = null;
-      device = null;
-      context = null;
-      compositeTexture = null;
-      compositeTextureView = null;
-      brushStampTexture = null;
-      stampBuffer = null;
-      stampUniformBuffer = null;
-      viewUniformBuffer = null;
-      eyedropperReadBuffer = null;
-      stampPipeline = null;
-      compositePipeline = null;
-      renderPipeline = null;
-      stampBindGroup = null;
-      renderBindGroup = null;
-      renderBindGroupLayout = null;
-      paintSampler = null;
+      renderer = null;
       layers = [];
       layerList = [];
       activeLayerId = null;
@@ -931,7 +702,7 @@
           if (!hasFitInitialView) {
             hasFitInitialView = true;
             fitToScreen();
-          } else if (device && context && renderPipeline && renderBindGroup) {
+          } else if (renderer) {
             scheduleFrame();
           }
         }
@@ -998,7 +769,7 @@
   }
 
   async function doEyedropperSample(screenX: number, screenY: number) {
-    if (!device || !compositeTexture || !eyedropperReadBuffer || !canvasEl) return;
+    if (!renderer || !canvasEl) return;
 
     isEyedropperReading = true;
 
@@ -1012,8 +783,7 @@
 
       flushPendingWorkForExport();
 
-      const [r, g, b, a] = await readTexturePixel(device, compositeTexture, eyedropperReadBuffer, docX, docY);
-      color = premultipliedRgbaToHex(r, g, b, a);
+      color = await renderer.readCompositePixelAsHex(docX, docY);
     } finally {
       isEyedropperReading = false;
       if (eyedropperNeedsResample) {
@@ -1081,14 +851,14 @@
 
     if (e.button === 0) {
       const activeLayer = getActiveLayer();
-      if (!device || !activeLayer || !activeLayer.visible || activeLayer.locked) return;
+      if (!renderer || !activeLayer || !activeLayer.visible || activeLayer.locked) return;
 
       isDrawing = true;
       strokeUsesPressure = hasRealPressure(e);
       currentStrokeHistory?.before.destroy();
       currentStrokeHistory = {
         layerId: activeLayer.id,
-        before: copyTexture(device, activeLayer.texture, documentWidth, documentHeight, "Paint stroke before snapshot"),
+        before: renderer.copyTexture(activeLayer.texture, "Paint stroke before snapshot"),
       };
       strokeHadPaint = false;
 
@@ -1100,7 +870,7 @@
       const opacity = getBrushOpacity(e, strokeUsesPressure, getMinimumPressureOpacity());
       const rgba = hexToVec4(color);
       lastPoint = { x, y, radius, opacity };
-      stampQueue.distanceSinceLastStamp = 0;
+      renderer.stampDistanceSinceLastStamp = 0;
       queueStamp(x, y, radius, withAlpha(rgba, opacity));
       canvas.setPointerCapture(e.pointerId);
     }
@@ -1168,7 +938,7 @@
     isResizingBrush = false;
     isEyedropping = false;
     strokeUsesPressure = false;
-    stampQueue.distanceSinceLastStamp = 0;
+    if (renderer) renderer.stampDistanceSinceLastStamp = 0;
     cancelEyedropperSample();
     updateBrushPreview(e);
 
@@ -1198,7 +968,7 @@
     isDrawing = false;
     isEyedropping = false;
     strokeUsesPressure = false;
-    stampQueue.distanceSinceLastStamp = 0;
+    if (renderer) renderer.stampDistanceSinceLastStamp = 0;
     cancelEyedropperSample();
     brushPreviewVisible = false;
 
