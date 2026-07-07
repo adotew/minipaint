@@ -14,8 +14,8 @@
     MIN_ZOOM,
   } from "./core/constants";
   import { hexToVec4, withAlpha, type Rgba } from "./core/color";
-  import { getStampBounds, getStampHalfSize, getStampSpacing } from "./core/geometry";
-  import { clamp, lerp } from "./core/math";
+  import { getStampHalfSize } from "./core/geometry";
+  import { clamp } from "./core/math";
   import type { LayerId, LayerMetadata } from "./core/types";
   import { HistoryManager, type HistoryEntry, type LayerAddHistoryEntry } from "./document/history";
   import {
@@ -59,6 +59,7 @@
     screenToCanvas as screenToCanvasPoint,
     zoomToActualSize,
   } from "./input/panZoom";
+  import { StampQueue } from "./input/stampQueue";
   import { createProjectBlob, decodeProjectBlob } from "./persistence/projectIO";
   import { pixelsToPngBlob } from "./persistence/png";
   import brushStampUrl from "../assets/charcoal-removebg-preview.png";
@@ -143,7 +144,6 @@
   let isDrawing = false;
   let strokeUsesPressure = false;
   let lastPoint = { x: 0, y: 0, radius: 0, opacity: 1 };
-  let distanceSinceLastStamp = 0;
   let currentStrokeHistory: { layerId: LayerId; before: GPUTexture } | null = null;
   let strokeHadPaint = false;
 
@@ -167,13 +167,7 @@
   let wheelAccum = 0;
 
   // ---- pending stamps (batched per frame) ----
-  type PendingStamp = {
-    x: number;
-    y: number;
-    radius: number;
-    rgba: Rgba;
-  };
-  let pendingStamps: PendingStamp[] = [];
+  let stampQueue = new StampQueue();
   let rafId: number | null = null;
 
   // ---- current canvas internal size (set by ResizeObserver) ----
@@ -328,7 +322,7 @@
     isPanning = false;
     isResizingBrush = false;
     strokeUsesPressure = false;
-    distanceSinceLastStamp = 0;
+    stampQueue.distanceSinceLastStamp = 0;
   }
 
   function restoreLayerAdd(entry: LayerAddHistoryEntry) {
@@ -549,9 +543,9 @@
   function flushPendingWorkForExport() {
     cancelScheduledFrame();
 
-    const maxFlushes = Math.ceil(pendingStamps.length / MAX_STAMPS_PER_FRAME) + 2;
+    const maxFlushes = Math.ceil(stampQueue.length / MAX_STAMPS_PER_FRAME) + 2;
     let flushes = 0;
-    while (pendingStamps.length > 0) {
+    while (stampQueue.length > 0) {
       if (flushes > maxFlushes) {
         throw new Error("Could not flush pending paint data before export.");
       }
@@ -584,7 +578,7 @@
 
     cancelScheduledFrame();
     resetInteractionState();
-    pendingStamps = [];
+    stampQueue.clear();
     clearHistory();
 
     documentWidth = nextWidth;
@@ -634,12 +628,12 @@
 
     cancelScheduledFrame();
     resetInteractionState();
-    pendingStamps = [];
+    stampQueue.clear();
 
     const { manifest, layers: decodedLayers } = await decodeProjectBlob(blob);
     const loadedLayers: PaintLayer[] = [];
     resetInteractionState();
-    pendingStamps = [];
+    stampQueue.clear();
     clearHistory();
     documentWidth = manifest.canvas.width;
     documentHeight = manifest.canvas.height;
@@ -709,9 +703,8 @@
       return;
     }
 
-    const stamps = pendingStamps;
+    const stamps = stampQueue.takeAll();
     const n = stamps.length;
-    pendingStamps = [];
 
     const encoder = device.createCommandEncoder();
 
@@ -719,7 +712,7 @@
       const activeLayer = getActiveLayer();
       const count = Math.min(n, MAX_STAMPS_PER_FRAME);
       if (n > count) {
-        pendingStamps = stamps.slice(count).concat(pendingStamps);
+        stampQueue.prepend(stamps.slice(count));
       }
 
       const rendered = renderStamps({
@@ -743,7 +736,7 @@
 
     device.queue.submit([encoder.finish()]);
 
-    if (pendingStamps.length > 0) {
+    if (stampQueue.length > 0) {
       scheduleFrame();
       return;
     }
@@ -777,26 +770,9 @@
     radius: number,
     rgba: Rgba,
   ) {
-    const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(
-      x,
-      y,
-      radius,
-      documentWidth,
-      documentHeight,
-    );
+    const queued = stampQueue.queueStamp(x, y, radius, rgba, documentWidth, documentHeight);
+    if (!queued) return false;
 
-    if (
-      x + halfWidth < 0 ||
-      y + halfHeight < 0 ||
-      x - halfWidth >= documentWidth ||
-      y - halfHeight >= documentHeight ||
-      maxX < minX ||
-      maxY < minY
-    ) {
-      return false;
-    }
-
-    pendingStamps.push({ x, y, radius, rgba });
     if (isDrawing) strokeHadPaint = true;
     scheduleFrame();
     return true;
@@ -813,36 +789,23 @@
     o2: number,
     rgba: Rgba,
   ) {
-    const dx = x2 - x1;
-    const dy = y2 - y1;
-    const dist = Math.hypot(dx, dy);
-    if (dist === 0) return;
+    const queued = stampQueue.stampLine({
+      x1,
+      y1,
+      r1,
+      o1,
+      x2,
+      y2,
+      r2,
+      o2,
+      rgba,
+      documentWidth,
+      documentHeight,
+    });
+    if (queued === 0) return;
 
-    let travelled = 0;
-    while (travelled < dist) {
-      const spacingT = travelled / dist;
-      const spacingRadius = lerp(r1, r2, spacingT);
-      const spacing = getStampSpacing(spacingRadius);
-      const distanceToNextStamp = Math.max(0, spacing - distanceSinceLastStamp);
-      const remainingDistance = dist - travelled;
-
-      if (distanceToNextStamp > remainingDistance) {
-        distanceSinceLastStamp += remainingDistance;
-        return;
-      }
-
-      travelled += distanceToNextStamp;
-      const t = travelled / dist;
-      const radius = lerp(r1, r2, t);
-      const opacity = lerp(o1, o2, t);
-      queueStamp(
-        x1 + dx * t,
-        y1 + dy * t,
-        radius,
-        withAlpha(rgba, opacity),
-      );
-      distanceSinceLastStamp = 0;
-    }
+    if (isDrawing) strokeHadPaint = true;
+    scheduleFrame();
   }
 
   // ====================================================================
@@ -1137,7 +1100,7 @@
       const opacity = getBrushOpacity(e, strokeUsesPressure, getMinimumPressureOpacity());
       const rgba = hexToVec4(color);
       lastPoint = { x, y, radius, opacity };
-      distanceSinceLastStamp = 0;
+      stampQueue.distanceSinceLastStamp = 0;
       queueStamp(x, y, radius, withAlpha(rgba, opacity));
       canvas.setPointerCapture(e.pointerId);
     }
@@ -1205,7 +1168,7 @@
     isResizingBrush = false;
     isEyedropping = false;
     strokeUsesPressure = false;
-    distanceSinceLastStamp = 0;
+    stampQueue.distanceSinceLastStamp = 0;
     cancelEyedropperSample();
     updateBrushPreview(e);
 
@@ -1235,7 +1198,7 @@
     isDrawing = false;
     isEyedropping = false;
     strokeUsesPressure = false;
-    distanceSinceLastStamp = 0;
+    stampQueue.distanceSinceLastStamp = 0;
     cancelEyedropperSample();
     brushPreviewVisible = false;
 
