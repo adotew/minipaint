@@ -171,14 +171,14 @@
 
 </script>
 
-<div class="flex w-[200px] flex-col gap-3">
+<div class="flex w-[300px] flex-col gap-3">
   <!-- Saturation / Value area -->
   <div
     role="button"
     tabindex="-1"
     aria-label="Color saturation and brightness picker"
     bind:this={svEl}
-    class="relative aspect-square w-full cursor-crosshair rounded-md"
+    class="relative aspect-square w-full cursor-crosshair rounded-xl"
     style="background:
       linear-gradient(to bottom, transparent, #000),
       linear-gradient(to right, #fff, hsl({h}, 100%, 50%));"
@@ -201,14 +201,14 @@
     aria-valuemin="0"
     aria-valuemax="360"
     bind:this={hueEl}
-    class="relative h-4 w-full cursor-pointer rounded-md"
+    class="relative h-4 w-full cursor-pointer rounded-xl"
     style="background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);"
     onpointerdown={onHuePointerDown}
     onpointermove={onHuePointerMove}
     onpointerup={onHuePointerUp}
   >
     <div
-      class="pointer-events-none absolute top-0 h-full w-2 -translate-x-1/2 rounded-sm border border-white shadow-[0_0_0_1px_rgba(0,0,0,0.5)]"
+      class="pointer-events-none absolute top-0 h-full w-4 -translate-x-1/2 rounded-sm border border-white shadow-[0_0_0_1px_rgba(0,0,0,0.5)]"
       style="left: {(h / 360) * 100}%; background-color: hsl({h}, 100%, 50%);"
     ></div>
   </div>
