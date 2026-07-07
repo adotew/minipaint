@@ -142,13 +142,21 @@
   let hasFitInitialView = false;
   let isPanning = $state(false);
   let isSpaceHeld = $state(false);
+  let isEyedropperHeld = $state(false);
+  let isEyedropping = $state(false);
 
   // ---- image rendering hint ----
   let imageRenderHint = $derived(zoom < 1 ? "auto" : "pixelated");
 
   // ---- cursor ----
   let cursor = $derived(
-    isPanning ? "grabbing" : isSpaceHeld ? "grab" : "none"
+    isEyedropperHeld || isEyedropping
+      ? "crosshair"
+      : isPanning
+        ? "grabbing"
+        : isSpaceHeld
+          ? "grab"
+          : "none"
   );
   let brushPreviewVisible = $state(false);
   let brushPreviewX = $state(0);
@@ -202,6 +210,14 @@
   let isResizingBrush = false;
   let resizeStartY = 0;
   let resizeStartBrushSize = 0;
+
+  // ---- eyedropper state ----
+  let isEyedropperReading = false;
+  let eyedropperNeedsResample = false;
+  let eyedropperLastScreenX = 0;
+  let eyedropperLastScreenY = 0;
+  let eyedropperRafId: number | null = null;
+  let eyedropperReadBuffer: GPUBuffer | null = null;
 
   // ---- pan tracking ----
   let panStart = { clientX: 0, clientY: 0, offsetX: 0, offsetY: 0 };
@@ -1512,6 +1528,12 @@
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
 
+      // Eyedropper readback buffer (one RGBA pixel, bytesPerRow aligned to 256)
+      const eyedropperBuf = dev.createBuffer({
+        size: COPY_BYTES_PER_ROW_ALIGNMENT,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+
       // ---- Render pipeline (stamp into active layer texture) ----
       const stampBindGroupLayout = dev.createBindGroupLayout({
         entries: [
@@ -1658,6 +1680,7 @@
       stampBuffer = brushBuf;
       stampUniformBuffer = stampUbo;
       viewUniformBuffer = viewUbo;
+      eyedropperReadBuffer = eyedropperBuf;
       stampPipeline = stmpPipeline;
       compositePipeline = compPipeline;
       renderPipeline = rndrPipeline;
@@ -1679,11 +1702,16 @@
 
     return () => {
       cancelled = true;
+      if (eyedropperRafId !== null) {
+        cancelAnimationFrame(eyedropperRafId);
+        eyedropperRafId = null;
+      }
       compositeTexture?.destroy();
       brushStampTexture?.destroy();
       stampBuffer?.destroy();
       stampUniformBuffer?.destroy();
       viewUniformBuffer?.destroy();
+      eyedropperReadBuffer?.destroy();
       for (const layer of layers) {
         destroyLayer(layer);
       }
@@ -1700,6 +1728,7 @@
       stampBuffer = null;
       stampUniformBuffer = null;
       viewUniformBuffer = null;
+      eyedropperReadBuffer = null;
       stampPipeline = null;
       compositePipeline = null;
       renderPipeline = null;
@@ -1792,6 +1821,80 @@
     scheduleFrame();
   }
 
+  function cancelEyedropperSample() {
+    if (eyedropperRafId === null) return;
+    cancelAnimationFrame(eyedropperRafId);
+    eyedropperRafId = null;
+  }
+
+  function requestEyedropperSample(screenX: number, screenY: number) {
+    eyedropperLastScreenX = screenX;
+    eyedropperLastScreenY = screenY;
+
+    if (isEyedropperReading) {
+      eyedropperNeedsResample = true;
+      return;
+    }
+
+    if (eyedropperRafId !== null) return;
+    eyedropperRafId = requestAnimationFrame(() => {
+      eyedropperRafId = null;
+      void doEyedropperSample(eyedropperLastScreenX, eyedropperLastScreenY);
+    });
+  }
+
+  async function doEyedropperSample(screenX: number, screenY: number) {
+    if (!device || !compositeTexture || !eyedropperReadBuffer || !canvasEl) return;
+
+    isEyedropperReading = true;
+
+    try {
+      const rect = canvasEl.getBoundingClientRect();
+      const cssX = screenX - rect.left;
+      const cssY = screenY - rect.top;
+      const { x, y } = screenToCanvas(cssX, cssY);
+      const docX = Math.floor(clamp(x, 0, documentWidth - 1));
+      const docY = Math.floor(clamp(y, 0, documentHeight - 1));
+
+      flushPendingWorkForExport();
+
+      const encoder = device.createCommandEncoder();
+      encoder.copyTextureToBuffer(
+        { texture: compositeTexture, origin: { x: docX, y: docY } },
+        {
+          buffer: eyedropperReadBuffer,
+          bytesPerRow: COPY_BYTES_PER_ROW_ALIGNMENT,
+          rowsPerImage: 1,
+        },
+        [1, 1, 1],
+      );
+      device.queue.submit([encoder.finish()]);
+
+      await eyedropperReadBuffer.mapAsync(GPUMapMode.READ);
+      const mapped = eyedropperReadBuffer.getMappedRange();
+      const pixels = new Uint8Array(mapped);
+      const r = pixels[0];
+      const g = pixels[1];
+      const b = pixels[2];
+      const a = pixels[3];
+      eyedropperReadBuffer.unmap();
+
+      const unpremultiply = (channel: number) =>
+        a === 0 ? 255 : Math.min(255, Math.round(channel * 255 / a));
+      color =
+        "#" +
+        [unpremultiply(r), unpremultiply(g), unpremultiply(b)]
+          .map((channel) => channel.toString(16).padStart(2, "0"))
+          .join("");
+    } finally {
+      isEyedropperReading = false;
+      if (eyedropperNeedsResample) {
+        eyedropperNeedsResample = false;
+        void doEyedropperSample(eyedropperLastScreenX, eyedropperLastScreenY);
+      }
+    }
+  }
+
   // ====================================================================
   //  Event handlers
   // ====================================================================
@@ -1816,6 +1919,15 @@
     if (!canvas) return;
 
     updateBrushPreview(e);
+
+    if (e.button === 0 && isEyedropperHeld) {
+      e.preventDefault();
+      brushPreviewVisible = false;
+      isEyedropping = true;
+      requestEyedropperSample(e.clientX, e.clientY);
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
 
     if (e.button === 1 || (e.button === 0 && isSpaceHeld)) {
       brushPreviewVisible = false;
@@ -1869,6 +1981,11 @@
   function handlePointerMove(e: PointerEvent) {
     updateBrushPreview(e);
 
+    if (isEyedropping) {
+      requestEyedropperSample(e.clientX, e.clientY);
+      return;
+    }
+
     if (isResizingBrush) {
       const deltaY = e.clientY - resizeStartY;
       brushSize = Math.round(
@@ -1920,17 +2037,29 @@
 
   function handlePointerUp(e: PointerEvent) {
     const wasDrawing = isDrawing;
+    const wasEyedropping = isEyedropping;
 
     isDrawing = false;
     isPanning = false;
     isResizingBrush = false;
+    isEyedropping = false;
     strokeUsesPressure = false;
     distanceSinceLastStamp = 0;
+    cancelEyedropperSample();
     updateBrushPreview(e);
 
     if (wasDrawing) {
       shouldSaveHistoryAfterFrame = true;
       scheduleFrame();
+    }
+
+    if (wasEyedropping) {
+      try {
+        canvasEl?.releasePointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+      return;
     }
 
     try {
@@ -1943,8 +2072,10 @@
   function handlePointerLeave() {
     const wasDrawing = isDrawing;
     isDrawing = false;
+    isEyedropping = false;
     strokeUsesPressure = false;
     distanceSinceLastStamp = 0;
+    cancelEyedropperSample();
     brushPreviewVisible = false;
 
     if (wasDrawing) {
@@ -1955,7 +2086,7 @@
 
   function updateBrushPreview(e: PointerEvent) {
     const canvas = canvasEl;
-    if (!canvas || isPanning || isSpaceHeld) {
+    if (!canvas || isPanning || isSpaceHeld || isEyedropperHeld || isEyedropping) {
       brushPreviewVisible = false;
       return;
     }
@@ -2028,6 +2159,12 @@
         return;
       }
 
+      if ((e.code === "AltLeft" || e.code === "AltRight") && !e.repeat) {
+        e.preventDefault();
+        isEyedropperHeld = true;
+        return;
+      }
+
       if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "n") {
         e.preventDefault();
         addLayer();
@@ -2082,6 +2219,13 @@
       if (e.code === "Space") {
         e.preventDefault();
         isSpaceHeld = false;
+      }
+
+      if (e.code === "AltLeft" || e.code === "AltRight") {
+        e.preventDefault();
+        isEyedropperHeld = false;
+        isEyedropping = false;
+        cancelEyedropperSample();
       }
     }
 
