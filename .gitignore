@@ -17,7 +17,7 @@ build/
 .vite/
 
 # Local planning docs
-/docs/
+/docs
 
 # Tauri / Rust build output
 src-tauri/target/
