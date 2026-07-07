@@ -2,6 +2,17 @@
   import { onMount } from "svelte";
   import ColorPicker from "./lib/ColorPicker.svelte";
   import WebGPUCanvas from "./lib/WebGPUCanvas.svelte";
+  import {
+    addRecentFileToList,
+    fileNameFromPath,
+    loadRecentFiles,
+    removeRecentFileFromList,
+    renameRecentFileInList,
+    renameRecentFileLocally,
+    saveRecentFiles,
+    stripProjectExtension,
+    type RecentFile,
+  } from "./lib/app/recentFiles";
 
   let color = $state("#aabbcc");
   let brushSize = $state(10);
@@ -13,18 +24,10 @@
     loadProject: (blob: Blob) => Promise<{ width: number; height: number }>;
   };
 
-  type RecentFile = {
-    path: string;
-    name: string;
-  };
-
   type OpenProjectResult = {
     path: string;
     bytes: ArrayBuffer;
   };
-
-  const RECENT_FILES_KEY = "minipaint.recentFiles";
-  const MAX_RECENT_FILES = 8;
 
   let webgpuCanvas: CanvasHandle | undefined = $state();
   let isExporting = $state(false);
@@ -79,45 +82,13 @@
     return `minipaint-${timestamp}.minipaint`;
   }
 
-  function fileNameFromPath(path: string) {
-    return path.split(/[\\/]/).pop() || path;
-  }
-
   function focusNode(node: HTMLElement) {
     node.focus();
     node.select();
   }
 
-  function loadRecentFiles() {
-    try {
-      const parsed = JSON.parse(localStorage.getItem(RECENT_FILES_KEY) ?? "[]") as unknown;
-      if (!Array.isArray(parsed)) return [];
-      return parsed
-        .filter((item): item is RecentFile => {
-          return Boolean(
-            item &&
-              typeof item === "object" &&
-              "path" in item &&
-              "name" in item &&
-              typeof item.path === "string" &&
-              typeof item.name === "string",
-          );
-        })
-        .map((item) => ({ ...item, name: item.name.replace(/\.minipaint$/i, "") }))
-        .slice(0, MAX_RECENT_FILES);
-    } catch {
-      return [];
-    }
-  }
-
-  function saveRecentFiles(files: RecentFile[]) {
-    localStorage.setItem(RECENT_FILES_KEY, JSON.stringify(files));
-  }
-
   function addRecentFile(path: string) {
-    const existing = recentFiles.find((item) => item.path === path);
-    const file = { path, name: existing?.name ?? fileNameFromPath(path).replace(/\.minipaint$/i, "") };
-    recentFiles = [file, ...recentFiles.filter((item) => item.path !== path)].slice(0, MAX_RECENT_FILES);
+    recentFiles = addRecentFileToList(recentFiles, path);
     saveRecentFiles(recentFiles);
   }
 
@@ -148,15 +119,10 @@
           cancelRename();
           return;
         }
-        const updatedName = fileNameFromPath(newPath).replace(/\.minipaint$/i, "");
-        recentFiles = recentFiles.map((item) =>
-          item.path === path ? { path: newPath, name: updatedName } : item,
-        );
+        recentFiles = renameRecentFileInList(recentFiles, path, newPath, newName);
         if (currentProjectPath === path) currentProjectPath = newPath;
       } else {
-        recentFiles = recentFiles.map((item) =>
-          item.path === path ? { ...item, name: newName } : item,
-        );
+        recentFiles = renameRecentFileLocally(recentFiles, path, newName);
       }
       saveRecentFiles(recentFiles);
       cancelRename();
@@ -167,7 +133,7 @@
   }
 
   function removeRecentFile(path: string) {
-    recentFiles = recentFiles.filter((item) => item.path !== path);
+    recentFiles = removeRecentFileFromList(recentFiles, path);
     saveRecentFiles(recentFiles);
     if (recentMenuPath === path) recentMenuPath = null;
   }
@@ -297,7 +263,7 @@
 
   $effect(() => {
     const name = currentProjectPath
-      ? fileNameFromPath(currentProjectPath).replace(/\.minipaint$/i, "")
+      ? stripProjectExtension(fileNameFromPath(currentProjectPath))
       : "Untitled";
     document.title = showStartPage
       ? "minipaint"
