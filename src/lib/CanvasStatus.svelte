@@ -12,7 +12,9 @@
   const modeStyle = $derived(
     toolMode === "eraser"
       ? "background: #ffd9e2; color: #141014;"
-      : "background: #d8f3ff; color: #0b1720;",
+      : toolMode === "smudge"
+        ? "background: #ede9fe; color: #1e1b4b;"
+        : "background: #d8f3ff; color: #0b1720;",
   );
 </script>
 

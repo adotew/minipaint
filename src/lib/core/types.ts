@@ -1,6 +1,6 @@
 export type LayerId = string;
 
-export type ToolMode = "brush" | "eraser";
+export type ToolMode = "brush" | "eraser" | "smudge";
 
 export type LayerMetadata = {
   id: LayerId;

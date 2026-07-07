@@ -12,8 +12,9 @@ import {
   renderStamps,
   writeViewUniforms,
 } from "./rendering";
+import { createSmudgeBindGroup } from "./pipelines";
 import type { GpuCanvasResources } from "./rendererSetup";
-import { copyTexture, readTexturePixels, restoreTexture, uploadTexturePixels } from "./textures";
+import { createDocumentTexture, copyTexture, readTexturePixels, restoreTexture, uploadTexturePixels } from "./textures";
 import { StampQueue } from "../input/stampQueue";
 
 export type RendererViewState = {
@@ -44,12 +45,16 @@ export class GpuPaintRenderer {
   private compositeTexture: GPUTexture;
   private compositeTextureView: GPUTextureView;
   private brushStampTexture: GPUTexture;
+  private brushStampTextureView: GPUTextureView;
+  private brushSampler: GPUSampler;
   private stampBuffer: GPUBuffer;
   private stampUniformBuffer: GPUBuffer;
   private viewUniformBuffer: GPUBuffer;
   private eyedropperReadBuffer: GPUBuffer;
   private stampPipeline: GPURenderPipeline;
   private eraserStampPipeline: GPURenderPipeline;
+  private smudgePipeline: GPURenderPipeline;
+  private smudgeBindGroupLayout: GPUBindGroupLayout;
   private compositePipeline: GPURenderPipeline;
   private renderPipeline: GPURenderPipeline;
   private stampBindGroup: GPUBindGroup;
@@ -58,6 +63,8 @@ export class GpuPaintRenderer {
   private paintSampler: GPUSampler;
   private compositeBindGroupLayout: GPUBindGroupLayout;
   private compositeSampler: GPUSampler;
+  private smudgeSourceTexture: GPUTexture | null = null;
+  private smudgeBindGroup: GPUBindGroup | null = null;
   private stampDataView: Float32Array;
   private stampQueue = new StampQueue();
   private rafId: number | null = null;
@@ -78,12 +85,16 @@ export class GpuPaintRenderer {
     this.compositeTexture = resources.compositeTexture;
     this.compositeTextureView = resources.compositeTextureView;
     this.brushStampTexture = resources.brushStampTexture;
+    this.brushStampTextureView = resources.brushStampTextureView;
+    this.brushSampler = resources.brushSampler;
     this.stampBuffer = resources.stampBuffer;
     this.stampUniformBuffer = resources.stampUniformBuffer;
     this.viewUniformBuffer = resources.viewUniformBuffer;
     this.eyedropperReadBuffer = resources.eyedropperReadBuffer;
     this.stampPipeline = resources.stampPipeline;
     this.eraserStampPipeline = resources.eraserStampPipeline;
+    this.smudgePipeline = resources.smudgePipeline;
+    this.smudgeBindGroupLayout = resources.smudgeBindGroupLayout;
     this.compositePipeline = resources.compositePipeline;
     this.renderPipeline = resources.renderPipeline;
     this.stampBindGroup = resources.stampBindGroup;
@@ -181,11 +192,52 @@ export class GpuPaintRenderer {
     this.compositeTextureView = resources.view;
     this.renderBindGroup = resources.renderBindGroup;
     oldCompositeTexture.destroy();
+    this.resetSmudgeSourceTexture();
     this.markCompositeDirty();
   }
 
   clearStamps() {
     this.stampQueue.clear();
+  }
+
+  private resetSmudgeSourceTexture() {
+    this.smudgeSourceTexture?.destroy();
+    this.smudgeSourceTexture = null;
+    this.smudgeBindGroup = null;
+  }
+
+  private ensureSmudgeSourceTexture() {
+    if (this.smudgeSourceTexture) return this.smudgeSourceTexture;
+
+    this.smudgeSourceTexture = createDocumentTexture(
+      this.device,
+      this.documentWidth,
+      this.documentHeight,
+      "Smudge source texture",
+    );
+    this.smudgeBindGroup = createSmudgeBindGroup(
+      this.device,
+      this.smudgeBindGroupLayout,
+      this.brushSampler,
+      this.brushStampTextureView,
+      this.stampBuffer,
+      this.stampUniformBuffer,
+      this.brushSampler,
+      this.smudgeSourceTexture.createView(),
+    );
+    return this.smudgeSourceTexture;
+  }
+
+  beginSmudgeStroke(layer: PaintLayer, x: number, y: number) {
+    this.stampQueue.beginSmudgeStroke(x, y);
+    const smudgeSourceTexture = this.ensureSmudgeSourceTexture();
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyTextureToTexture(
+      { texture: layer.texture },
+      { texture: smudgeSourceTexture },
+      [this.documentWidth, this.documentHeight, 1],
+    );
+    this.device.queue.submit([encoder.finish()]);
   }
 
   queueStamp(x: number, y: number, radius: number, rgba: Rgba, mode: ToolMode) {
@@ -277,7 +329,10 @@ export class GpuPaintRenderer {
         activeLayer: this.callbacks.getActiveLayer(),
         stampPipeline: this.stampPipeline,
         eraserStampPipeline: this.eraserStampPipeline,
+        smudgePipeline: this.smudgePipeline,
         stampBindGroup: this.stampBindGroup,
+        smudgeBindGroup: this.smudgeBindGroup,
+        smudgeSourceTexture: this.smudgeSourceTexture,
       });
       if (rendered) {
         this.callbacks.onPaintRendered();
@@ -335,6 +390,7 @@ export class GpuPaintRenderer {
   dispose() {
     this.cancelScheduledFrame();
     this.compositeTexture.destroy();
+    this.resetSmudgeSourceTexture();
     this.brushStampTexture.destroy();
     this.stampBuffer.destroy();
     this.stampUniformBuffer.destroy();

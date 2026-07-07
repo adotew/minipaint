@@ -670,6 +670,8 @@
       const activeLayer = getActiveLayer();
       if (!renderer || !activeLayer || !activeLayer.visible || activeLayer.locked) return;
 
+      if (toolMode === "smudge") flushPendingWorkForExport();
+
       isDrawing = true;
       strokeToolMode = toolMode;
       strokeUsesPressure = hasRealPressure(e);
@@ -687,7 +689,11 @@
       const rgba = hexToVec4(color);
       lastPoint = { x, y, radius, opacity };
       renderer.stampDistanceSinceLastStamp = 0;
-      queueStamp(x, y, radius, withAlpha(rgba, opacity), strokeToolMode);
+      if (strokeToolMode === "smudge") {
+        renderer.beginSmudgeStroke(activeLayer, x, y);
+      } else {
+        queueStamp(x, y, radius, withAlpha(rgba, opacity), strokeToolMode);
+      }
       canvas.setPointerCapture(e.pointerId);
     }
   }
@@ -836,6 +842,7 @@
       else if (command === "eyedropper-down") isEyedropperHeld = true;
       else if (command === "brush-mode") toolMode = "brush";
       else if (command === "eraser-mode") toolMode = "eraser";
+      else if (command === "smudge-mode") toolMode = "smudge";
       else if (command === "add-layer") addLayer();
       else if (command === "zoom-in") zoomAroundCenter(1.25);
       else if (command === "zoom-out") zoomAroundCenter(0.8);

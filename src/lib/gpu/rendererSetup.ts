@@ -9,6 +9,7 @@ import {
 } from "./buffers";
 import {
   createCompositePipelineResources,
+  createSmudgePipelineResources,
   createStampPipelineResources,
   createViewportPipelineResources,
 } from "./pipelines";
@@ -21,12 +22,16 @@ export type GpuCanvasResources = {
   compositeTexture: GPUTexture;
   compositeTextureView: GPUTextureView;
   brushStampTexture: GPUTexture;
+  brushStampTextureView: GPUTextureView;
+  brushSampler: GPUSampler;
   stampBuffer: GPUBuffer;
   stampUniformBuffer: GPUBuffer;
   viewUniformBuffer: GPUBuffer;
   eyedropperReadBuffer: GPUBuffer;
   stampPipeline: GPURenderPipeline;
   eraserStampPipeline: GPURenderPipeline;
+  smudgePipeline: GPURenderPipeline;
+  smudgeBindGroupLayout: GPUBindGroupLayout;
   compositePipeline: GPURenderPipeline;
   renderPipeline: GPURenderPipeline;
   stampBindGroup: GPUBindGroup;
@@ -87,6 +92,7 @@ export async function initializeGpuCanvas(options: {
   }
 
   const brushStampTexture = createBrushStampTexture(device, brushBitmap);
+  const brushStampTextureView = brushStampTexture.createView();
   brushBitmap.close?.();
 
   const paintSampler = device.createSampler({
@@ -111,10 +117,11 @@ export async function initializeGpuCanvas(options: {
   const stampResources = createStampPipelineResources(
     device,
     brushSampler,
-    brushStampTexture.createView(),
+    brushStampTextureView,
     stampBuffer,
     stampUniformBuffer,
   );
+  const smudgeResources = createSmudgePipelineResources(device);
   const compositeResources = createCompositePipelineResources(device);
   const viewportResources = createViewportPipelineResources(
     device,
@@ -140,12 +147,16 @@ export async function initializeGpuCanvas(options: {
     compositeTexture,
     compositeTextureView,
     brushStampTexture,
+    brushStampTextureView,
+    brushSampler,
     stampBuffer,
     stampUniformBuffer,
     viewUniformBuffer,
     eyedropperReadBuffer,
     stampPipeline: stampResources.pipeline,
     eraserStampPipeline: stampResources.eraserPipeline,
+    smudgePipeline: smudgeResources.pipeline,
+    smudgeBindGroupLayout: smudgeResources.bindGroupLayout,
     compositePipeline: compositeResources.pipeline,
     renderPipeline: viewportResources.pipeline,
     stampBindGroup: stampResources.bindGroup,

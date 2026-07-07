@@ -9,9 +9,12 @@ export type Stamp = {
   radius: number;
   rgba: Rgba;
   mode: ToolMode;
+  sourceX?: number;
+  sourceY?: number;
 };
 
 export type StampTargetLayer = {
+  texture: GPUTexture;
   view: GPUTextureView;
   visible: boolean;
   locked: boolean;
@@ -74,11 +77,83 @@ export function writeStampData(
     stampDataView[offset + 5] = stamp.rgba[1];
     stampDataView[offset + 6] = stamp.rgba[2];
     stampDataView[offset + 7] = stamp.rgba[3];
-    stampDataView[offset + 8] = minX;
-    stampDataView[offset + 9] = minY;
+    stampDataView[offset + 8] = stamp.sourceX ?? minX;
+    stampDataView[offset + 9] = stamp.sourceY ?? minY;
     stampDataView[offset + 10] = maxX;
     stampDataView[offset + 11] = maxY;
   }
+}
+
+function renderStampRun(options: {
+  encoder: GPUCommandEncoder;
+  activeLayer: StampTargetLayer;
+  stampPipeline: GPURenderPipeline;
+  eraserStampPipeline: GPURenderPipeline;
+  stampBindGroup: GPUBindGroup;
+  mode: ToolMode;
+  runStart: number;
+  runEnd: number;
+}) {
+  const pass = options.encoder.beginRenderPass({
+    colorAttachments: [
+      {
+        view: options.activeLayer.view,
+        loadOp: "load",
+        storeOp: "store",
+      },
+    ],
+  });
+  pass.setBindGroup(0, options.stampBindGroup);
+  pass.setPipeline(options.mode === "eraser" ? options.eraserStampPipeline : options.stampPipeline);
+  pass.draw(6, options.runEnd - options.runStart, 0, options.runStart);
+  pass.end();
+}
+
+function renderSmudgeStamp(options: {
+  encoder: GPUCommandEncoder;
+  activeLayer: StampTargetLayer;
+  smudgePipeline: GPURenderPipeline;
+  smudgeBindGroup: GPUBindGroup;
+  smudgeSourceTexture: GPUTexture;
+  stamp: Stamp;
+  stampIndex: number;
+  documentWidth: number;
+  documentHeight: number;
+}) {
+  const pass = options.encoder.beginRenderPass({
+    colorAttachments: [
+      {
+        view: options.activeLayer.view,
+        loadOp: "load",
+        storeOp: "store",
+      },
+    ],
+  });
+  pass.setPipeline(options.smudgePipeline);
+  pass.setBindGroup(0, options.smudgeBindGroup);
+  pass.draw(6, 1, 0, options.stampIndex);
+  pass.end();
+
+  const bounds = getStampBounds(
+    options.stamp.x,
+    options.stamp.y,
+    options.stamp.radius,
+    options.documentWidth,
+    options.documentHeight,
+  );
+  if (bounds.maxX < bounds.minX || bounds.maxY < bounds.minY) return;
+
+  options.encoder.copyTextureToTexture(
+    {
+      texture: options.activeLayer.texture,
+      origin: { x: bounds.minX, y: bounds.minY },
+    },
+    {
+      texture: options.smudgeSourceTexture,
+      origin: { x: bounds.minX, y: bounds.minY },
+    },
+    [bounds.width, bounds.height, 1],
+  );
 }
 
 export function renderStamps(options: {
@@ -93,7 +168,10 @@ export function renderStamps(options: {
   activeLayer: StampTargetLayer | null;
   stampPipeline: GPURenderPipeline;
   eraserStampPipeline: GPURenderPipeline;
+  smudgePipeline: GPURenderPipeline;
   stampBindGroup: GPUBindGroup;
+  smudgeBindGroup: GPUBindGroup | null;
+  smudgeSourceTexture: GPUTexture | null;
 }) {
   const activeLayer = options.activeLayer;
   if (!activeLayer || !activeLayer.visible || activeLayer.locked) return false;
@@ -113,32 +191,50 @@ export function renderStamps(options: {
     options.count * FLOATS_PER_STAMP,
   );
 
-  const pass = options.encoder.beginRenderPass({
-    colorAttachments: [
-      {
-        view: activeLayer.view,
-        loadOp: "load",
-        storeOp: "store",
-      },
-    ],
-  });
-  pass.setBindGroup(0, options.stampBindGroup);
-
+  let rendered = false;
   let runStart = 0;
   while (runStart < options.count) {
     const mode = options.stamps[runStart].mode;
+
+    if (mode === "smudge") {
+      if (options.smudgeBindGroup && options.smudgeSourceTexture) {
+        renderSmudgeStamp({
+          encoder: options.encoder,
+          activeLayer,
+          smudgePipeline: options.smudgePipeline,
+          smudgeBindGroup: options.smudgeBindGroup,
+          smudgeSourceTexture: options.smudgeSourceTexture,
+          stamp: options.stamps[runStart],
+          stampIndex: runStart,
+          documentWidth: options.documentWidth,
+          documentHeight: options.documentHeight,
+        });
+        rendered = true;
+      }
+      runStart++;
+      continue;
+    }
+
     let runEnd = runStart + 1;
     while (runEnd < options.count && options.stamps[runEnd].mode === mode) {
       runEnd++;
     }
 
-    pass.setPipeline(mode === "eraser" ? options.eraserStampPipeline : options.stampPipeline);
-    pass.draw(6, runEnd - runStart, 0, runStart);
+    renderStampRun({
+      encoder: options.encoder,
+      activeLayer,
+      stampPipeline: options.stampPipeline,
+      eraserStampPipeline: options.eraserStampPipeline,
+      stampBindGroup: options.stampBindGroup,
+      mode,
+      runStart,
+      runEnd,
+    });
+    rendered = true;
     runStart = runEnd;
   }
 
-  pass.end();
-  return true;
+  return rendered;
 }
 
 export function rebuildComposite(

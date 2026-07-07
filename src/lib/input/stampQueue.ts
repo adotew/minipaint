@@ -8,6 +8,7 @@ import type { Stamp } from "../gpu/rendering";
 export class StampQueue {
   pending: Stamp[] = [];
   distanceSinceLastStamp = 0;
+  private smudgeSourcePoint: { x: number; y: number } | null = null;
 
   get length() {
     return this.pending.length;
@@ -16,6 +17,12 @@ export class StampQueue {
   clear() {
     this.pending = [];
     this.distanceSinceLastStamp = 0;
+    this.smudgeSourcePoint = null;
+  }
+
+  beginSmudgeStroke(x: number, y: number) {
+    this.distanceSinceLastStamp = 0;
+    this.smudgeSourcePoint = { x, y };
   }
 
   takeAll() {
@@ -36,6 +43,8 @@ export class StampQueue {
     mode: ToolMode,
     documentWidth: number,
     documentHeight: number,
+    sourceX?: number,
+    sourceY?: number,
   ) {
     const { minX, maxX, minY, maxY, halfWidth, halfHeight } = getStampBounds(
       x,
@@ -56,7 +65,7 @@ export class StampQueue {
       return false;
     }
 
-    this.pending.push({ x, y, radius, rgba, mode });
+    this.pending.push({ x, y, radius, rgba, mode, sourceX, sourceY });
     return true;
   }
 
@@ -97,16 +106,24 @@ export class StampQueue {
       const t = travelled / dist;
       const radius = lerp(options.r1, options.r2, t);
       const opacity = lerp(options.o1, options.o2, t);
+      const x = options.x1 + dx * t;
+      const y = options.y1 + dy * t;
+      const sourcePoint = options.mode === "smudge"
+        ? this.smudgeSourcePoint ?? { x: options.x1, y: options.y1 }
+        : null;
       if (this.queueStamp(
-        options.x1 + dx * t,
-        options.y1 + dy * t,
+        x,
+        y,
         radius,
         withAlpha(options.rgba, opacity),
         options.mode,
         options.documentWidth,
         options.documentHeight,
+        sourcePoint?.x,
+        sourcePoint?.y,
       )) {
         queued++;
+        if (options.mode === "smudge") this.smudgeSourcePoint = { x, y };
       }
       this.distanceSinceLastStamp = 0;
     }

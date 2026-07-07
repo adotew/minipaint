@@ -5,6 +5,7 @@ export type KeyboardShortcutCommand =
   | "eyedropper-up"
   | "brush-mode"
   | "eraser-mode"
+  | "smudge-mode"
   | "add-layer"
   | "zoom-in"
   | "zoom-out"
@@ -34,6 +35,7 @@ export function getKeyDownShortcutCommand(e: KeyboardEvent): KeyboardShortcutCom
   if (!e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey) {
     if (key === "b") return "brush-mode";
     if (key === "e") return "eraser-mode";
+    if (key === "s") return "smudge-mode";
   }
 
   const commandKey = e.ctrlKey || e.metaKey;

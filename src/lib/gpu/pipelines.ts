@@ -1,4 +1,5 @@
 import stampShaderCode from "../shaders/stamp.wgsl?raw";
+import smudgeShaderCode from "../shaders/smudge.wgsl?raw";
 import blitShaderCode from "../shaders/blit.wgsl?raw";
 import compositeShaderCode from "../shaders/composite.wgsl?raw";
 
@@ -6,6 +7,11 @@ export type StampPipelineResources = {
   pipeline: GPURenderPipeline;
   eraserPipeline: GPURenderPipeline;
   bindGroup: GPUBindGroup;
+};
+
+export type SmudgePipelineResources = {
+  bindGroupLayout: GPUBindGroupLayout;
+  pipeline: GPURenderPipeline;
 };
 
 export type CompositePipelineResources = {
@@ -93,6 +99,65 @@ export function createStampPipelineResources(
   });
 
   return { pipeline, eraserPipeline, bindGroup };
+}
+
+export function createSmudgePipelineResources(dev: GPUDevice): SmudgePipelineResources {
+  const bindGroupLayout = dev.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+      { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+      {
+        binding: 3,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        buffer: { type: "uniform" },
+      },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+      { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } },
+    ],
+  });
+
+  const shaderModule = dev.createShaderModule({ code: smudgeShaderCode });
+  const pipeline = dev.createRenderPipeline({
+    layout: dev.createPipelineLayout({
+      bindGroupLayouts: [bindGroupLayout],
+    }),
+    vertex: {
+      module: shaderModule,
+      entryPoint: "vs",
+    },
+    fragment: {
+      module: shaderModule,
+      entryPoint: "fs",
+      targets: [{ format: "rgba8unorm" }],
+    },
+    primitive: { topology: "triangle-list" },
+  });
+
+  return { bindGroupLayout, pipeline };
+}
+
+export function createSmudgeBindGroup(
+  dev: GPUDevice,
+  layout: GPUBindGroupLayout,
+  brushSampler: GPUSampler,
+  brushTextureView: GPUTextureView,
+  stampBuffer: GPUBuffer,
+  stampUniformBuffer: GPUBuffer,
+  sourceSampler: GPUSampler,
+  sourceTextureView: GPUTextureView,
+) {
+  return dev.createBindGroup({
+    layout,
+    entries: [
+      { binding: 0, resource: brushSampler },
+      { binding: 1, resource: brushTextureView },
+      { binding: 2, resource: { buffer: stampBuffer } },
+      { binding: 3, resource: { buffer: stampUniformBuffer } },
+      { binding: 4, resource: sourceSampler },
+      { binding: 5, resource: sourceTextureView },
+    ],
+  });
 }
 
 export function createCompositePipelineResources(dev: GPUDevice): CompositePipelineResources {
