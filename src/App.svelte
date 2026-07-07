@@ -464,7 +464,6 @@
                 >
                   Rename
                 </button>
-                <div class="my-1 border-t border-zinc-700"></div>
                 <button
                   class="block w-full rounded px-2 py-1.5 text-left text-zinc-200 hover:bg-zinc-800"
                   type="button"
