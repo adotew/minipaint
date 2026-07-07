@@ -3,7 +3,6 @@
 
   import LayerPanel from "./LayerPanel.svelte";
   import {
-    COPY_BYTES_PER_ROW_ALIGNMENT,
     DEFAULT_CANVAS_HEIGHT,
     DEFAULT_CANVAS_WIDTH,
     FLOATS_PER_STAMP,
@@ -39,6 +38,7 @@
     createStampPipelineResources,
     createViewportPipelineResources,
   } from "./gpu/pipelines";
+  import { premultipliedRgbaToHex, readTexturePixel } from "./gpu/readback";
   import {
     blitCompositeToViewport as renderCompositeToViewport,
     rebuildComposite as renderRebuildComposite,
@@ -1150,34 +1150,8 @@
 
       flushPendingWorkForExport();
 
-      const encoder = device.createCommandEncoder();
-      encoder.copyTextureToBuffer(
-        { texture: compositeTexture, origin: { x: docX, y: docY } },
-        {
-          buffer: eyedropperReadBuffer,
-          bytesPerRow: COPY_BYTES_PER_ROW_ALIGNMENT,
-          rowsPerImage: 1,
-        },
-        [1, 1, 1],
-      );
-      device.queue.submit([encoder.finish()]);
-
-      await eyedropperReadBuffer.mapAsync(GPUMapMode.READ);
-      const mapped = eyedropperReadBuffer.getMappedRange();
-      const pixels = new Uint8Array(mapped);
-      const r = pixels[0];
-      const g = pixels[1];
-      const b = pixels[2];
-      const a = pixels[3];
-      eyedropperReadBuffer.unmap();
-
-      const unpremultiply = (channel: number) =>
-        a === 0 ? 255 : Math.min(255, Math.round(channel * 255 / a));
-      color =
-        "#" +
-        [unpremultiply(r), unpremultiply(g), unpremultiply(b)]
-          .map((channel) => channel.toString(16).padStart(2, "0"))
-          .join("");
+      const [r, g, b, a] = await readTexturePixel(device, compositeTexture, eyedropperReadBuffer, docX, docY);
+      color = premultipliedRgbaToHex(r, g, b, a);
     } finally {
       isEyedropperReading = false;
       if (eyedropperNeedsResample) {
