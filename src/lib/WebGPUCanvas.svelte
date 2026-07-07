@@ -62,6 +62,13 @@
     hasRealPressure,
     resizeBrushSize,
   } from "./input/brush";
+  import {
+    applyZoomAt,
+    fitDocumentToViewport,
+    panView,
+    screenToCanvas as screenToCanvasPoint,
+    zoomToActualSize,
+  } from "./input/panZoom";
   import { createProjectBlob, decodeProjectBlob } from "./persistence/projectIO";
   import { pixelsToPngBlob } from "./persistence/png";
   import brushStampUrl from "../assets/charcoal-removebg-preview.png";
@@ -215,10 +222,7 @@
   }
 
   function screenToCanvas(screenX: number, screenY: number) {
-    return {
-      x: screenX / zoom + offsetX,
-      y: screenY / zoom + offsetY,
-    };
+    return screenToCanvasPoint(screenX, screenY, { zoom, offsetX, offsetY });
   }
 
   // ====================================================================
@@ -1081,38 +1085,30 @@
   // ====================================================================
 
   function applyZoom(factor: number, cursorX: number, cursorY: number) {
-    const oldZoom = zoom;
-    const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, oldZoom * factor));
-    if (newZoom === oldZoom) return;
+    const next = applyZoomAt({ zoom, offsetX, offsetY }, factor, cursorX, cursorY);
+    if (next.zoom === zoom && next.offsetX === offsetX && next.offsetY === offsetY) return;
 
-    const newOffsetX = offsetX + cursorX * (1 / oldZoom - 1 / newZoom);
-    const newOffsetY = offsetY + cursorY * (1 / oldZoom - 1 / newZoom);
-
-    zoom = newZoom;
-    offsetX = newOffsetX;
-    offsetY = newOffsetY;
-
+    zoom = next.zoom;
+    offsetX = next.offsetX;
+    offsetY = next.offsetY;
     scheduleFrame();
   }
 
   function fitToScreen() {
     const canvas = canvasEl;
     if (!canvas) return;
-    const vw = canvas.clientWidth;
-    const vh = canvas.clientHeight;
-    const scale = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min(vw / documentWidth, vh / documentHeight)));
-    const visibleWidth = vw / scale;
-    const visibleHeight = vh / scale;
-    zoom = scale;
-    offsetX = (documentWidth - visibleWidth) / 2;
-    offsetY = (documentHeight - visibleHeight) / 2;
+    const next = fitDocumentToViewport(canvas.clientWidth, canvas.clientHeight, documentWidth, documentHeight);
+    zoom = next.zoom;
+    offsetX = next.offsetX;
+    offsetY = next.offsetY;
     scheduleFrame();
   }
 
   function zoomTo100() {
-    zoom = 1;
-    offsetX = 0;
-    offsetY = 0;
+    const next = zoomToActualSize();
+    zoom = next.zoom;
+    offsetX = next.offsetX;
+    offsetY = next.offsetY;
     scheduleFrame();
   }
 
@@ -1288,10 +1284,9 @@
     }
 
     if (isPanning) {
-      const dx = e.clientX - panStart.clientX;
-      const dy = e.clientY - panStart.clientY;
-      offsetX = panStart.offsetX - dx / zoom;
-      offsetY = panStart.offsetY - dy / zoom;
+      const next = panView(panStart, e.clientX, e.clientY, zoom);
+      offsetX = next.offsetX;
+      offsetY = next.offsetY;
       scheduleFrame();
       brushPreviewVisible = false;
       return;
