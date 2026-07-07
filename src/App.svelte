@@ -96,6 +96,7 @@
               typeof item.name === "string",
           );
         })
+        .map((item) => ({ ...item, name: item.name.replace(/\.minipaint$/i, "") }))
         .slice(0, MAX_RECENT_FILES);
     } catch {
       return [];
@@ -107,7 +108,7 @@
   }
 
   function addRecentFile(path: string) {
-    const file = { path, name: fileNameFromPath(path) };
+    const file = { path, name: fileNameFromPath(path).replace(/\.minipaint$/i, "") };
     recentFiles = [file, ...recentFiles.filter((item) => item.path !== path)].slice(0, MAX_RECENT_FILES);
     saveRecentFiles(recentFiles);
   }
